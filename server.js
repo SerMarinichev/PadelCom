@@ -29,10 +29,13 @@ const server = http.createServer(async (req, res) => {
   if (url === "/api/data" && req.method === "GET") {
     try {
       const r = await fetch(BLOB_URL, { headers: { Accept: "application/json" } });
+      if (!r.ok) throw new Error(`upstream ${r.status}`);
       const text = await r.text();
-      send(res, r.ok ? 200 : 200, r.ok ? text : "{}", { "Content-Type": "application/json" });
+      send(res, 200, text, { "Content-Type": "application/json" });
     } catch (e) {
-      send(res, 200, "{}", { "Content-Type": "application/json" }); // fail soft — app falls back to defaults
+      // Do NOT fail soft with "{}" here — that would look like "no data yet" to the
+      // client and get saved back, permanently wiping real data on a transient outage.
+      send(res, 502, JSON.stringify({ error: "storage load failed", detail: String(e) }), { "Content-Type": "application/json" });
     }
     return;
   }
