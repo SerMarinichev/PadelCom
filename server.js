@@ -66,12 +66,14 @@ const server = http.createServer(async (req, res) => {
     if (err) {
       fs.readFile(path.join(PUBLIC_DIR, "index.html"), (err2, indexContent) => {
         if (err2) return send(res, 404, "Not found");
-        send(res, 200, indexContent, { "Content-Type": MIME[".html"] });
+        send(res, 200, indexContent, { "Content-Type": MIME[".html"], "Cache-Control": "no-cache, no-store, must-revalidate" });
       });
       return;
     }
     const ext = path.extname(filePath);
-    send(res, 200, content, { "Content-Type": MIME[ext] || "application/octet-stream" });
+    // no-cache on html/js so a new deploy is always picked up immediately, never stuck on an old cached bundle
+    const cacheControl = ext === ".html" || ext === ".js" ? "no-cache, no-store, must-revalidate" : "public, max-age=3600";
+    send(res, 200, content, { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": cacheControl });
   });
 });
 
