@@ -15,6 +15,8 @@ const MIME = {
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
 };
 
 function send(res, status, body, headers = {}) {
@@ -24,6 +26,22 @@ function send(res, status, body, headers = {}) {
 
 const server = http.createServer(async (req, res) => {
   const url = req.url.split("?")[0];
+
+  // ---- YouTube oEmbed proxy (official public endpoint, no API key needed) ----
+  if (req.url.split("?")[0] === "/api/oembed" && req.method === "GET") {
+    const parsed = new URL(req.url, `http://${req.headers.host}`);
+    const target = parsed.searchParams.get("url") || "";
+    try {
+      if (!/youtube\.com|youtu\.be/i.test(target)) throw new Error("unsupported platform");
+      const r = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(target)}&format=json`);
+      if (!r.ok) throw new Error(`upstream ${r.status}`);
+      const json = await r.json();
+      send(res, 200, JSON.stringify({ title: json.title, thumbnail: json.thumbnail_url }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 404, JSON.stringify({ error: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
 
   // ---- storage API (proxied to the external persistent store) ----
   if (url === "/api/data" && req.method === "GET") {
@@ -74,9 +92,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const ext = path.extname(filePath);
-    // no-cache on html/js so a new deploy is always picked up immediately, never stuck on an old cached bundle
-    const cacheControl = ext === ".html" || ext === ".js" ? "no-cache, no-store, must-revalidate" : "public, max-age=3600";
-    send(res, 200, content, { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": cacheControl });
+    const isManifest = url === "/manifest.json";
+    const contentType = isManifest ? "application/manifest+json; charset=utf-8" : (MIME[ext] || "application/octet-stream");
+    // no-cache on html/js so a new deploy is always picked up immediately, never stuck on an old cached bundle.
+    // Icons rarely change, so they can cache longer.
+    const cacheControl = ext === ".html" || ext === ".js" ? "no-cache, no-store, must-revalidate" : "public, max-age=86400";
+    send(res, 200, content, { "Content-Type": contentType, "Cache-Control": cacheControl });
   });
 });
 
