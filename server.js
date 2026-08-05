@@ -1,15 +1,14 @@
-// PadelCom server — plain Node.js, no external dependencies (nothing to npm install).
+// PadelCom server — plain Node.js, no external dependencies.
+// Data is proxied to an external persistent store (jsonblob.com) because Render's
+// free-tier filesystem is wiped on every redeploy/restart/spin-down — a local
+// data.json file would lose everything each time.
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, "public");
-const DATA_FILE = path.join(__dirname, "data.json");
-
-if (!fs.existsSync(DATA_FILE)) {
-  fs.writeFileSync(DATA_FILE, "{}");
-}
+const BLOB_URL = process.env.BLOB_URL || "https://jsonblob.com/api/jsonBlob/019fcc36-1926-7e53-8cbd-206f16f5e16d";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -23,30 +22,36 @@ function send(res, status, body, headers = {}) {
   res.end(body);
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = req.url.split("?")[0];
 
-  // ---- storage API ----
+  // ---- storage API (proxied to the external persistent store) ----
   if (url === "/api/data" && req.method === "GET") {
-    fs.readFile(DATA_FILE, "utf8", (err, content) => {
-      if (err) return send(res, 500, JSON.stringify({ error: "read failed" }), { "Content-Type": "application/json" });
-      send(res, 200, content, { "Content-Type": "application/json" });
-    });
+    try {
+      const r = await fetch(BLOB_URL, { headers: { Accept: "application/json" } });
+      const text = await r.text();
+      send(res, r.ok ? 200 : 200, r.ok ? text : "{}", { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 200, "{}", { "Content-Type": "application/json" }); // fail soft — app falls back to defaults
+    }
     return;
   }
 
   if (url === "/api/data" && (req.method === "PUT" || req.method === "POST")) {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => {
+    req.on("end", async () => {
       try {
         JSON.parse(body); // validate
-        fs.writeFile(DATA_FILE, body, (err) => {
-          if (err) return send(res, 500, JSON.stringify({ error: "write failed" }), { "Content-Type": "application/json" });
-          send(res, 200, body, { "Content-Type": "application/json" });
+        const r = await fetch(BLOB_URL, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body,
         });
-      } catch {
-        send(res, 400, JSON.stringify({ error: "invalid json" }), { "Content-Type": "application/json" });
+        if (!r.ok) throw new Error(`upstream ${r.status}`);
+        send(res, 200, body, { "Content-Type": "application/json" });
+      } catch (e) {
+        send(res, 502, JSON.stringify({ error: "storage save failed", detail: String(e) }), { "Content-Type": "application/json" });
       }
     });
     return;
@@ -59,7 +64,6 @@ const server = http.createServer((req, res) => {
   }
   fs.readFile(filePath, (err, content) => {
     if (err) {
-      // SPA fallback -> index.html
       fs.readFile(path.join(PUBLIC_DIR, "index.html"), (err2, indexContent) => {
         if (err2) return send(res, 404, "Not found");
         send(res, 200, indexContent, { "Content-Type": MIME[".html"] });
