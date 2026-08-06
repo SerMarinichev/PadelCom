@@ -77,6 +77,32 @@ function readJsonBody(req) {
     req.on("error", reject);
   });
 }
+// Generic handler for "one admin entity by id" routes (PUT to edit, DELETE to remove).
+// Returns true if it handled the request (matched prefix + method), false otherwise.
+async function handleAdminEntityRoute(req, res, url, prefix, arrayKey, extraOnDelete) {
+  if (!url.startsWith(prefix) || (req.method !== "PUT" && req.method !== "DELETE")) return false;
+  if (!isAdminRequest(req)) {
+    send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" });
+    return true;
+  }
+  const id = url.slice(prefix.length);
+  try {
+    const data = await loadBlob();
+    const arr = data[arrayKey] || [];
+    if (req.method === "DELETE") {
+      data[arrayKey] = arr.filter((x) => x.id !== id);
+      if (extraOnDelete) extraOnDelete(data, id);
+    } else {
+      const patch = await readJsonBody(req);
+      data[arrayKey] = arr.map((x) => (x.id === id ? { ...x, ...patch, id } : x));
+    }
+    await saveBlob(data);
+    send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+  } catch (e) {
+    send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+  }
+  return true;
+}
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -149,32 +175,33 @@ const server = http.createServer(async (req, res) => {
 
   // ---- protected admin mutations: server verifies the session itself, the
   // client cannot bypass this by editing the page or crafting its own request ----
-  if (url.startsWith("/api/admin/players/") && (req.method === "PUT" || req.method === "DELETE")) {
-    if (!isAdminRequest(req)) {
-      send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" });
-      return;
-    }
-    const playerId = url.split("/").pop();
+  if (await handleAdminEntityRoute(req, res, url, "/api/admin/players/", "players", (data, id) => {
+    data.pairs = (data.pairs || []).filter((pr) => pr.primaryId !== id && pr.secondaryId !== id);
+    (data.sessions || []).forEach((s) => {
+      s.expenses = (s.expenses || []).map((e) => ({ ...e, splitAmong: (e.splitAmong || []).filter((x) => x !== id && x !== `pair:${id}`) }));
+    });
+  })) return;
+
+  if (url === "/api/admin/venues" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
     try {
+      const body = await readJsonBody(req);
       const data = await loadBlob();
-      const players = data.players || [];
-      if (req.method === "DELETE") {
-        data.players = players.filter((p) => p.id !== playerId);
-        data.pairs = (data.pairs || []).filter((pr) => pr.primaryId !== playerId && pr.secondaryId !== playerId);
-        (data.sessions || []).forEach((s) => {
-          s.expenses = (s.expenses || []).map((e) => ({ ...e, splitAmong: (e.splitAmong || []).filter((x) => x !== playerId && x !== `pair:${playerId}`) }));
-        });
-      } else {
-        const patch = await readJsonBody(req);
-        data.players = players.map((p) => (p.id === playerId ? { ...p, ...patch, id: playerId } : p));
-      }
+      const venue = { id: crypto.randomUUID(), name: body.name || "", type: body.type || "" };
+      data.places = [...(data.places || []), venue];
       await saveBlob(data);
-      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+      send(res, 200, JSON.stringify({ ok: true, venue }), { "Content-Type": "application/json" });
     } catch (e) {
       send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
     }
     return;
   }
+
+  if (await handleAdminEntityRoute(req, res, url, "/api/admin/venues/", "places")) return;
+  if (await handleAdminEntityRoute(req, res, url, "/api/admin/sessions/", "sessions")) return;
+  if (await handleAdminEntityRoute(req, res, url, "/api/admin/tournaments/", "tournaments")) return;
+  if (await handleAdminEntityRoute(req, res, url, "/api/admin/polls/", "polls")) return;
+  if (await handleAdminEntityRoute(req, res, url, "/api/admin/closed-transfers/", "closedTransfers")) return;
 
   // ---- protected admin mutations: articles (WikiPadel) ----
   if (url === "/api/admin/articles" && req.method === "POST") {
