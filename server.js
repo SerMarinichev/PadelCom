@@ -176,6 +176,81 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ---- protected admin mutations: articles (WikiPadel) ----
+  if (url === "/api/admin/articles" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const article = { id: crypto.randomUUID(), title: body.title || "", body: body.body || "", cover: body.cover || "", createdAt: new Date().toISOString().slice(0, 10) };
+      data.articles = [article, ...(data.articles || [])];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, article }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url.startsWith("/api/admin/articles/") && req.method === "PUT") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    const id = url.split("/").pop();
+    try {
+      const patch = await readJsonBody(req);
+      const data = await loadBlob();
+      data.articles = (data.articles || []).map((a) => (a.id === id ? { ...a, ...patch, id } : a));
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url.startsWith("/api/admin/articles/") && req.method === "DELETE") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    const id = url.split("/").pop();
+    try {
+      const data = await loadBlob();
+      data.articles = (data.articles || []).filter((a) => a.id !== id);
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  // ---- protected admin mutations: videos (WikiPadel) ----
+  if (url.startsWith("/api/admin/videos/") && req.method === "DELETE") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    const id = url.split("/").pop();
+    try {
+      const data = await loadBlob();
+      data.videos = (data.videos || []).filter((v) => v.id !== id);
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  // ---- protected admin mutations: settings (currency etc.) ----
+  if (url === "/api/admin/settings" && req.method === "PUT") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const patch = await readJsonBody(req);
+      const data = await loadBlob();
+      if (patch.currency) data.currency = patch.currency;
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
   // ---- storage API (proxied to the external persistent store) ----
   if (url === "/api/data" && req.method === "GET") {
     try {
