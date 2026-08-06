@@ -249,12 +249,21 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- protected admin mutations: videos (WikiPadel) ----
-  if (url.startsWith("/api/admin/videos/") && req.method === "DELETE") {
+  if (await handleAdminEntityRoute(req, res, url, "/api/admin/videos/", "videos")) return;
+
+  // ---- protected admin mutations: simple reference lists (типы объектов/событий и т.п.) ----
+  // Whitelisted keys only — this endpoint replaces the whole list at once, which keeps it
+  // simple and lets new list-type reference data reuse it later without new server code.
+  const LIST_KEYS = ["placeTypes", "eventTypes"];
+  if (url.startsWith("/api/admin/lists/") && req.method === "PUT") {
     if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
-    const id = url.split("/").pop();
+    const key = url.slice("/api/admin/lists/".length);
+    if (!LIST_KEYS.includes(key)) { send(res, 404, JSON.stringify({ error: "unknown list" }), { "Content-Type": "application/json" }); return; }
     try {
+      const body = await readJsonBody(req);
+      if (!Array.isArray(body.items)) throw new Error("items must be an array");
       const data = await loadBlob();
-      data.videos = (data.videos || []).filter((v) => v.id !== id);
+      data[key] = body.items;
       await saveBlob(data);
       send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
     } catch (e) {
