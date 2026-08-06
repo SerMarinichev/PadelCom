@@ -5,10 +5,78 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, "public");
 const BLOB_URL = process.env.BLOB_URL || "https://jsonblob.com/api/jsonBlob/019fcc36-1926-7e53-8cbd-206f16f5e16d";
+
+// ---- admin auth config ----
+// Set these on Render (Settings -> Environment), never commit real values to GitHub.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || ADMIN_PASSWORD || "padelcom-dev-secret";
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const COOKIE_NAME = "padelcom_admin";
+
+function sign(payload) {
+  return crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+}
+function makeSessionToken() {
+  const body = Buffer.from(JSON.stringify({ exp: Date.now() + SESSION_TTL_MS })).toString("base64url");
+  return `${body}.${sign(body)}`;
+}
+function verifySessionToken(token) {
+  if (!token || typeof token !== "string" || !token.includes(".")) return false;
+  const [body, sig] = token.split(".");
+  const expected = sign(body);
+  const a = Buffer.from(sig || "", "hex");
+  const b = Buffer.from(expected, "hex");
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  try {
+    const { exp } = JSON.parse(Buffer.from(body, "base64url").toString());
+    return typeof exp === "number" && Date.now() < exp;
+  } catch {
+    return false;
+  }
+}
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  const out = {};
+  header.split(";").forEach((part) => {
+    const idx = part.indexOf("=");
+    if (idx === -1) return;
+    out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  });
+  return out;
+}
+function isAdminRequest(req) {
+  const cookies = parseCookies(req);
+  return verifySessionToken(cookies[COOKIE_NAME]);
+}
+async function loadBlob() {
+  const r = await fetch(BLOB_URL, { headers: { Accept: "application/json" } });
+  if (!r.ok) throw new Error(`upstream ${r.status}`);
+  return r.json();
+}
+async function saveBlob(data) {
+  const r = await fetch(BLOB_URL, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!r.ok) throw new Error(`upstream ${r.status}`);
+  return data;
+}
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try { resolve(body ? JSON.parse(body) : {}); } catch (e) { reject(e); }
+    });
+    req.on("error", reject);
+  });
+}
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -39,6 +107,71 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, JSON.stringify({ title: json.title, thumbnail: json.thumbnail_url }), { "Content-Type": "application/json" });
     } catch (e) {
       send(res, 404, JSON.stringify({ error: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  // ---- admin auth ----
+  if (url === "/api/admin/login" && req.method === "POST") {
+    try {
+      const { password } = await readJsonBody(req);
+      if (!ADMIN_PASSWORD) {
+        send(res, 500, JSON.stringify({ error: "ADMIN_PASSWORD is not configured on the server" }), { "Content-Type": "application/json" });
+        return;
+      }
+      if (password !== ADMIN_PASSWORD) {
+        send(res, 401, JSON.stringify({ error: "wrong password" }), { "Content-Type": "application/json" });
+        return;
+      }
+      const token = makeSessionToken();
+      send(res, 200, JSON.stringify({ ok: true }), {
+        "Content-Type": "application/json",
+        "Set-Cookie": `${COOKIE_NAME}=${token}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax`,
+      });
+    } catch {
+      send(res, 400, JSON.stringify({ error: "bad request" }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url === "/api/admin/logout" && req.method === "POST") {
+    send(res, 200, JSON.stringify({ ok: true }), {
+      "Content-Type": "application/json",
+      "Set-Cookie": `${COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`,
+    });
+    return;
+  }
+
+  if (url === "/api/admin/session" && req.method === "GET") {
+    send(res, 200, JSON.stringify({ authenticated: isAdminRequest(req) }), { "Content-Type": "application/json" });
+    return;
+  }
+
+  // ---- protected admin mutations: server verifies the session itself, the
+  // client cannot bypass this by editing the page or crafting its own request ----
+  if (url.startsWith("/api/admin/players/") && (req.method === "PUT" || req.method === "DELETE")) {
+    if (!isAdminRequest(req)) {
+      send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" });
+      return;
+    }
+    const playerId = url.split("/").pop();
+    try {
+      const data = await loadBlob();
+      const players = data.players || [];
+      if (req.method === "DELETE") {
+        data.players = players.filter((p) => p.id !== playerId);
+        data.pairs = (data.pairs || []).filter((pr) => pr.primaryId !== playerId && pr.secondaryId !== playerId);
+        (data.sessions || []).forEach((s) => {
+          s.expenses = (s.expenses || []).map((e) => ({ ...e, splitAmong: (e.splitAmong || []).filter((x) => x !== playerId && x !== `pair:${playerId}`) }));
+        });
+      } else {
+        const patch = await readJsonBody(req);
+        data.players = players.map((p) => (p.id === playerId ? { ...p, ...patch, id: playerId } : p));
+      }
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
     }
     return;
   }
@@ -79,7 +212,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- static files ----
-  let filePath = path.join(PUBLIC_DIR, url === "/" ? "index.html" : url);
+  let filePath = path.join(PUBLIC_DIR, url === "/" ? "index.html" : (url === "/admin" ? "admin.html" : url));
   if (!filePath.startsWith(PUBLIC_DIR)) {
     return send(res, 403, "Forbidden");
   }
