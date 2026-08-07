@@ -203,6 +203,26 @@ const server = http.createServer(async (req, res) => {
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/polls/", "polls")) return;
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/closed-transfers/", "closedTransfers")) return;
 
+  if (url === "/api/admin/match-records" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const record = {
+        id: crypto.randomUUID(), date: body.date || "", matchType: body.matchType || "double",
+        sessionId: body.sessionId || null, participant1: body.participant1 || [], participant2: body.participant2 || [],
+        score1: Number(body.score1) || 0, score2: Number(body.score2) || 0,
+      };
+      data.matchRecords = [record, ...(data.matchRecords || [])];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, record }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+  if (await handleAdminEntityRoute(req, res, url, "/api/admin/match-records/", "matchRecords")) return;
+
   // ---- protected admin mutations: articles (WikiPadel) ----
   if (url === "/api/admin/articles" && req.method === "POST") {
     if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
