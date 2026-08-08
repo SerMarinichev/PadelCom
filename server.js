@@ -197,10 +197,85 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url === "/api/admin/pairs" && req.method === "PUT") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      if (!Array.isArray(body.pairs)) throw new Error("pairs must be an array");
+      const data = await loadBlob();
+      data.pairs = body.pairs;
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/venues/", "places")) return;
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/sessions/", "sessions")) return;
+  if (url === "/api/admin/tournaments" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const tournament = {
+        id: crypto.randomUUID(), name: body.name || "", date: body.date || "",
+        matchType: body.matchType || "single", gender: body.gender || "male",
+        format: body.format || "round_robin", ageCategory: body.ageCategory || "",
+        levelMin: body.levelMin || "", levelMax: body.levelMax || "",
+        maxParticipants: body.maxParticipants || null,
+        participants: body.participants || [], matches: [],
+        stages: body.format === "mixed"
+          ? [
+              { id: "qualifying", name: "Отборочный этап", participantIds: [...(body.participants || [])], matches: [] },
+              { id: "main", name: "Основной турнир", participantIds: [], matches: [] },
+              { id: "consolation", name: "Турнир для выбывших", participantIds: [], matches: [] },
+            ]
+          : null,
+      };
+      data.tournaments = [tournament, ...(data.tournaments || [])];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, tournament }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/tournaments/", "tournaments")) return;
+  if (url === "/api/admin/polls" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const poll = {
+        id: crypto.randomUUID(), question: body.question || "",
+        options: (body.options || []).map((text) => ({ id: crypto.randomUUID(), text })),
+        votes: {}, closed: false,
+      };
+      data.polls = [poll, ...(data.polls || [])];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, poll }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/polls/", "polls")) return;
+  if (url === "/api/admin/closed-transfers" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const record = { id: crypto.randomUUID(), from: body.from, to: body.to, amount: Number(body.amount) || 0, date: new Date().toISOString().slice(0, 10) };
+      data.closedTransfers = [...(data.closedTransfers || []), record];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, record }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/closed-transfers/", "closedTransfers")) return;
 
   if (url === "/api/admin/match-records" && req.method === "POST") {
