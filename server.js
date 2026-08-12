@@ -15,6 +15,24 @@ const BLOB_URL = process.env.BLOB_URL || "https://jsonblob.com/api/jsonBlob/019f
 // Set these on Render (Settings -> Environment), never commit real values to GitHub.
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || ADMIN_PASSWORD || "padelcom-dev-secret";
+
+// ---- Telegram bot (optional: only active if TELEGRAM_BOT_TOKEN is set) ----
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : null;
+// Verifies incoming webhook calls really come from Telegram (via the secret_token header
+// Telegram echoes back on every request once configured via setWebhook).
+const TELEGRAM_WEBHOOK_SECRET = crypto.createHash("sha256").update(TELEGRAM_BOT_TOKEN || "none").digest("hex").slice(0, 32);
+async function telegramCall(method, body) {
+  if (!TELEGRAM_API) throw new Error("TELEGRAM_BOT_TOKEN не настроен на сервере");
+  const r = await fetch(`${TELEGRAM_API}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await r.json();
+  if (!data.ok) throw new Error(data.description || "Telegram API error");
+  return data.result;
+}
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const COOKIE_NAME = "padelcom_admin";
 
@@ -378,6 +396,130 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
     } catch (e) {
       send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  // ---- Telegram bot integration ----
+  if (url === "/api/admin/telegram/status" && req.method === "GET") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const data = await loadBlob();
+      const info = TELEGRAM_API ? await telegramCall("getWebhookInfo").catch(() => null) : null;
+      send(res, 200, JSON.stringify({
+        configured: !!TELEGRAM_API,
+        webhookUrl: info ? info.url : "",
+        chats: data.telegramChats || [],
+        selectedChatId: data.telegramChatId || "",
+      }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url === "/api/admin/telegram/setup-webhook" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const { baseUrl } = await readJsonBody(req);
+      if (!baseUrl) throw new Error("baseUrl обязателен");
+      await telegramCall("setWebhook", {
+        url: `${baseUrl.replace(/\/$/, "")}/api/telegram/webhook`,
+        secret_token: TELEGRAM_WEBHOOK_SECRET,
+        allowed_updates: ["message", "poll_answer"],
+      });
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: String(e.message || e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url === "/api/admin/telegram/select-chat" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const { chatId } = await readJsonBody(req);
+      const data = await loadBlob();
+      data.telegramChatId = chatId;
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url === "/api/admin/telegram/send-poll" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const { pollId } = await readJsonBody(req);
+      const data = await loadBlob();
+      if (!data.telegramChatId) throw new Error("Сначала выберите чат для публикации");
+      const poll = (data.polls || []).find((p) => p.id === pollId);
+      if (!poll) throw new Error("Голосование не найдено");
+      const result = await telegramCall("sendPoll", {
+        chat_id: data.telegramChatId,
+        question: poll.question,
+        options: poll.options.map((o) => o.text),
+        is_anonymous: false,
+      });
+      poll.telegram = { chatId: data.telegramChatId, messageId: result.message_id, pollId: result.poll.id };
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: String(e.message || e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  // Public endpoint — Telegram calls this. Protected by the secret_token header instead
+  // of our usual session auth, since Telegram itself (not a logged-in admin) is the caller.
+  if (url === "/api/telegram/webhook" && req.method === "POST") {
+    if (req.headers["x-telegram-bot-api-secret-token"] !== TELEGRAM_WEBHOOK_SECRET) {
+      send(res, 401, "not telegram", { "Content-Type": "text/plain" });
+      return;
+    }
+    try {
+      const update = await readJsonBody(req);
+      const data = await loadBlob();
+      let changed = false;
+
+      // Remember any chat the bot has seen a message in, so the admin can pick it from
+      // a list instead of hunting down a numeric chat id by hand.
+      if (update.message && update.message.chat) {
+        const chat = update.message.chat;
+        data.telegramChats = data.telegramChats || [];
+        const existing = data.telegramChats.find((c) => String(c.id) === String(chat.id));
+        const title = chat.title || [chat.first_name, chat.last_name].filter(Boolean).join(" ") || chat.username || String(chat.id);
+        if (existing) existing.title = title;
+        else data.telegramChats.push({ id: chat.id, title });
+        changed = true;
+      }
+
+      // A poll answer: match it back to a PadelCom poll + player by Telegram @username.
+      if (update.poll_answer) {
+        const pa = update.poll_answer;
+        const poll = (data.polls || []).find((p) => p.telegram && p.telegram.pollId === pa.poll_id);
+        const username = pa.user && pa.user.username;
+        if (poll && username) {
+          const player = (data.players || []).find((pl) => pl.telegram && pl.telegram.replace(/^@/, "").toLowerCase() === username.toLowerCase());
+          if (player) {
+            poll.votes = poll.votes || {};
+            if (pa.option_ids && pa.option_ids.length > 0) {
+              const opt = poll.options[pa.option_ids[0]];
+              if (opt) poll.votes[player.id] = opt.id;
+            } else {
+              delete poll.votes[player.id];
+            }
+            changed = true;
+          }
+        }
+      }
+
+      if (changed) await saveBlob(data);
+      send(res, 200, "OK", { "Content-Type": "text/plain" });
+    } catch (e) {
+      send(res, 200, "OK", { "Content-Type": "text/plain" }); // always 200 so Telegram doesn't retry-storm
     }
     return;
   }
