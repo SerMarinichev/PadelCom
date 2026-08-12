@@ -1,7 +1,10 @@
 // PadelCom server — plain Node.js, no external dependencies.
-// Data is proxied to an external persistent store (jsonblob.com) because Render's
-// free-tier filesystem is wiped on every redeploy/restart/spin-down — a local
-// data.json file would lose everything each time.
+// Data is persisted to a private GitHub repository (via the Contents API) because
+// Render's free-tier filesystem is wiped on every redeploy/restart/spin-down — a
+// local data.json file would lose everything each time. GitHub was chosen after
+// jsonblob.com (the original store) started silently blocking/losing data —
+// GitHub gives us a generous, well-documented API and a free version history
+// of every save as a bonus (each save is a commit).
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -9,7 +12,6 @@ const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, "public");
-const BLOB_URL = process.env.BLOB_URL || "https://jsonblob.com/api/jsonBlob/019fcc36-1926-7e53-8cbd-206f16f5e16d";
 
 // ---- admin auth config ----
 // Set these on Render (Settings -> Environment), never commit real values to GitHub.
@@ -71,27 +73,69 @@ function isAdminRequest(req) {
   const cookies = parseCookies(req);
   return verifySessionToken(cookies[COOKIE_NAME]);
 }
-const JSONBLOB_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-};
-async function loadBlob() {
-  const r = await fetch(BLOB_URL, { headers: { Accept: "application/json", ...JSONBLOB_HEADERS } });
-  if (!r.ok) {
-    const body = await r.text().catch(() => "");
-    throw new Error(`upstream ${r.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
-  }
-  return r.json();
+// ---- GitHub-backed storage ----
+// GITHUB_REPO must be "owner/repo" (a private repo dedicated to data, separate
+// from the app's own code repo). GITHUB_TOKEN is a fine-grained PAT scoped to
+// that repo only, with Contents: Read & write.
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
+const GITHUB_REPO = process.env.GITHUB_REPO || "";
+const GITHUB_DATA_PATH = process.env.GITHUB_DATA_PATH || "data.json";
+const GITHUB_API = process.env.GITHUB_API_BASE || "https://api.github.com";
+
+function githubConfigured() {
+  return !!(GITHUB_TOKEN && GITHUB_REPO);
 }
-async function saveBlob(data) {
-  const payload = JSON.stringify(data);
-  const r = await fetch(BLOB_URL, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json", Accept: "application/json", ...JSONBLOB_HEADERS },
-    body: payload,
+
+async function githubRequest(method, apiPath, body) {
+  const r = await fetch(`${GITHUB_API}${apiPath}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json",
+      "User-Agent": "PadelCom-App",
+    },
+    body: body ? JSON.stringify(body) : undefined,
   });
+  return r;
+}
+
+async function loadBlob() {
+  if (!githubConfigured()) throw new Error("GITHUB_TOKEN / GITHUB_REPO не настроены");
+  const r = await githubRequest("GET", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`);
+  if (r.status === 404) return {}; // no data file yet — first run
   if (!r.ok) {
     const body = await r.text().catch(() => "");
-    throw new Error(`upstream ${r.status} (payload ${(payload.length / 1024).toFixed(0)}KB)${body ? `: ${body.slice(0, 300)}` : ""}`);
+    throw new Error(`github ${r.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
+  }
+  const json = await r.json();
+  const content = Buffer.from(json.content, "base64").toString("utf8");
+  return content ? JSON.parse(content) : {};
+}
+
+async function saveBlob(data) {
+  if (!githubConfigured()) throw new Error("GITHUB_TOKEN / GITHUB_REPO не настроены");
+  // GitHub requires the current file's sha to update it (prevents silently clobbering
+  // a concurrent write) — fetch it fresh every time rather than caching in memory.
+  let sha;
+  const getR = await githubRequest("GET", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`);
+  if (getR.ok) {
+    sha = (await getR.json()).sha;
+  } else if (getR.status !== 404) {
+    const body = await getR.text().catch(() => "");
+    throw new Error(`github ${getR.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
+  }
+  const payload = JSON.stringify(data, null, 2);
+  const content = Buffer.from(payload, "utf8").toString("base64");
+  const putR = await githubRequest("PUT", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`, {
+    message: `data update — ${new Date().toISOString()}`,
+    content,
+    ...(sha ? { sha } : {}),
+  });
+  if (!putR.ok) {
+    const body = await putR.text().catch(() => "");
+    throw new Error(`github ${putR.status} (payload ${(payload.length / 1024).toFixed(0)}KB)${body ? `: ${body.slice(0, 300)}` : ""}`);
   }
   return data;
 }
