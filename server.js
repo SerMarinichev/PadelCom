@@ -73,16 +73,23 @@ function isAdminRequest(req) {
 }
 async function loadBlob() {
   const r = await fetch(BLOB_URL, { headers: { Accept: "application/json" } });
-  if (!r.ok) throw new Error(`upstream ${r.status}`);
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    throw new Error(`upstream ${r.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
+  }
   return r.json();
 }
 async function saveBlob(data) {
+  const payload = JSON.stringify(data);
   const r = await fetch(BLOB_URL, {
     method: "PUT",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(data),
+    body: payload,
   });
-  if (!r.ok) throw new Error(`upstream ${r.status}`);
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    throw new Error(`upstream ${r.status} (payload ${(payload.length / 1024).toFixed(0)}KB)${body ? `: ${body.slice(0, 300)}` : ""}`);
+  }
   return data;
 }
 function readJsonBody(req) {
