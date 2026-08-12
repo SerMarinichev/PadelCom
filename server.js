@@ -455,6 +455,23 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- Telegram bot integration ----
+  if (url === "/api/admin/storage/status" && req.method === "GET") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    const result = { configured: githubConfigured(), repo: GITHUB_REPO, path: GITHUB_DATA_PATH, connected: false, fileExists: false, error: "" };
+    if (githubConfigured()) {
+      try {
+        const r = await githubRequest("GET", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`);
+        if (r.ok) { result.connected = true; result.fileExists = true; }
+        else if (r.status === 404) { result.connected = true; result.fileExists = false; }
+        else { const body = await r.text().catch(() => ""); result.error = `${r.status}${body ? `: ${body.slice(0, 200)}` : ""}`; }
+      } catch (e) {
+        result.error = String(e);
+      }
+    }
+    send(res, 200, JSON.stringify(result), { "Content-Type": "application/json" });
+    return;
+  }
+
   if (url === "/api/admin/telegram/status" && req.method === "GET") {
     if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
     try {
