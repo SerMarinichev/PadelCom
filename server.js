@@ -71,8 +71,11 @@ function isAdminRequest(req) {
   const cookies = parseCookies(req);
   return verifySessionToken(cookies[COOKIE_NAME]);
 }
+const JSONBLOB_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+};
 async function loadBlob() {
-  const r = await fetch(BLOB_URL, { headers: { Accept: "application/json" } });
+  const r = await fetch(BLOB_URL, { headers: { Accept: "application/json", ...JSONBLOB_HEADERS } });
   if (!r.ok) {
     const body = await r.text().catch(() => "");
     throw new Error(`upstream ${r.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
@@ -83,7 +86,7 @@ async function saveBlob(data) {
   const payload = JSON.stringify(data);
   const r = await fetch(BLOB_URL, {
     method: "PUT",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json", ...JSONBLOB_HEADERS },
     body: payload,
   });
   if (!r.ok) {
@@ -534,10 +537,8 @@ const server = http.createServer(async (req, res) => {
   // ---- storage API (proxied to the external persistent store) ----
   if (url === "/api/data" && req.method === "GET") {
     try {
-      const r = await fetch(BLOB_URL, { headers: { Accept: "application/json" } });
-      if (!r.ok) throw new Error(`upstream ${r.status}`);
-      const text = await r.text();
-      send(res, 200, text, { "Content-Type": "application/json" });
+      const data = await loadBlob();
+      send(res, 200, JSON.stringify(data), { "Content-Type": "application/json" });
     } catch (e) {
       // Do NOT fail soft with "{}" here — that would look like "no data yet" to the
       // client and get saved back, permanently wiping real data on a transient outage.
@@ -551,13 +552,8 @@ const server = http.createServer(async (req, res) => {
     req.on("data", (chunk) => (body += chunk));
     req.on("end", async () => {
       try {
-        JSON.parse(body); // validate
-        const r = await fetch(BLOB_URL, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body,
-        });
-        if (!r.ok) throw new Error(`upstream ${r.status}`);
+        const data = JSON.parse(body); // validate
+        await saveBlob(data);
         send(res, 200, body, { "Content-Type": "application/json" });
       } catch (e) {
         send(res, 502, JSON.stringify({ error: "storage save failed", detail: String(e) }), { "Content-Type": "application/json" });
