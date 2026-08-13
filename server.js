@@ -480,6 +480,10 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, JSON.stringify({
         configured: !!TELEGRAM_API,
         webhookUrl: info ? info.url : "",
+        pendingUpdates: info ? info.pending_update_count : null,
+        lastDeliveryError: info ? info.last_error_message : "",
+        lastDeliveryErrorAt: info && info.last_error_date ? new Date(info.last_error_date * 1000).toISOString() : "",
+        lastEvent: data.telegramLastEvent || null,
         chats: data.telegramChats || [],
         selectedChatId: data.telegramChatId || "",
       }), { "Content-Type": "application/json" });
@@ -555,6 +559,13 @@ const server = http.createServer(async (req, res) => {
       const data = await loadBlob();
       let changed = false;
 
+      // Diagnostic breadcrumb: record that *something* reached us, regardless of type,
+      // so the admin panel can show "last event received at ..." — this is the fastest
+      // way to tell a Telegram-side problem (privacy mode, webhook not registered) apart
+      // from a server-side one (chat/poll matching, storage save failing).
+      data.telegramLastEvent = { type: Object.keys(update).find((k) => k !== "update_id") || "unknown", at: new Date().toISOString() };
+      changed = true;
+
       // Remember any chat the bot has seen a message in, so the admin can pick it from
       // a list instead of hunting down a numeric chat id by hand.
       if (update.message && update.message.chat) {
@@ -590,6 +601,7 @@ const server = http.createServer(async (req, res) => {
       if (changed) await saveBlob(data);
       send(res, 200, "OK", { "Content-Type": "text/plain" });
     } catch (e) {
+      console.error("telegram webhook error:", e);
       send(res, 200, "OK", { "Content-Type": "text/plain" }); // always 200 so Telegram doesn't retry-storm
     }
     return;
@@ -613,9 +625,32 @@ const server = http.createServer(async (req, res) => {
     req.on("data", (chunk) => (body += chunk));
     req.on("end", async () => {
       try {
-        const data = JSON.parse(body); // validate
-        await saveBlob(data);
-        send(res, 200, body, { "Content-Type": "application/json" });
+        const incoming = JSON.parse(body); // validate
+        // Telegram-related fields are written exclusively by the webhook, out-of-band
+        // from any client. A browser tab's in-memory copy can be stale by the time it
+        // saves, and because every save overwrites the whole blob, a stale save would
+        // silently erase chats/events the webhook discovered in the meantime. Always
+        // keep the server's current values here regardless of what the client sent —
+        // no client (app or admin restore-from-backup) legitimately needs to change them.
+        try {
+          const current = await loadBlob();
+          incoming.telegramChats = current.telegramChats || [];
+          incoming.telegramChatId = current.telegramChatId || incoming.telegramChatId || "";
+          incoming.telegramLastEvent = current.telegramLastEvent || null;
+          // Same staleness risk applies to votes a Telegram poll_answer added in the
+          // background: merge any vote the current server copy has that the incoming
+          // (possibly stale) copy is missing, per poll, rather than dropping it.
+          const currentPolls = current.polls || [];
+          incoming.polls = (incoming.polls || []).map((p) => {
+            const curPoll = currentPolls.find((cp) => cp.id === p.id);
+            if (curPoll && curPoll.votes) {
+              return { ...p, votes: { ...curPoll.votes, ...(p.votes || {}) } };
+            }
+            return p;
+          });
+        } catch { /* if the current copy can't be read, fall through and save as-is */ }
+        await saveBlob(incoming);
+        send(res, 200, JSON.stringify(incoming), { "Content-Type": "application/json" });
       } catch (e) {
         send(res, 502, JSON.stringify({ error: "storage save failed", detail: String(e) }), { "Content-Type": "application/json" });
       }
