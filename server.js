@@ -476,9 +476,16 @@ const server = http.createServer(async (req, res) => {
     if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
     try {
       const data = await loadBlob();
-      const info = TELEGRAM_API ? await telegramCall("getWebhookInfo").catch(() => null) : null;
+      let info = null;
+      let apiError = "";
+      if (TELEGRAM_API) {
+        try { info = await telegramCall("getWebhookInfo"); }
+        catch (e) { apiError = String(e.message || e); }
+      }
       send(res, 200, JSON.stringify({
         configured: !!TELEGRAM_API,
+        tokenPreview: TELEGRAM_BOT_TOKEN ? `${TELEGRAM_BOT_TOKEN.slice(0, 6)}… (${TELEGRAM_BOT_TOKEN.length} символов)` : "не задан",
+        apiError,
         webhookUrl: info ? info.url : "",
         pendingUpdates: info ? info.pending_update_count : null,
         lastDeliveryError: info ? info.last_error_message : "",
