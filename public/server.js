@@ -68,6 +68,7 @@ function flowKey(chatId, userId) { return `${chatId}:${userId}`; }
 async function startMatchFlow(data, chatId, userId) {
   const today = todayISOServer();
   const sessions = (data.sessions || []).filter((s) => s.date === today);
+  console.log(`[startMatchFlow] today=${today} sessionsFound=${sessions.length} totalSessionsInData=${(data.sessions || []).length}`);
   if (sessions.length === 0) {
     await telegramCall("sendMessage", { chat_id: chatId, text: "На сегодня не нашёл событие в PadelCom — сначала создайте его в приложении." });
     return;
@@ -728,7 +729,9 @@ const server = http.createServer(async (req, res) => {
         const text = update.message.text.trim();
         const chatId = update.message.chat.id;
         const userId = update.message.from.id;
-        if (/^\/(матч|match)(@\w+)?/i.test(text)) {
+        const isMatchCmd = /^\/(матч|match)(@\w+)?/i.test(text);
+        console.log(`[telegram webhook] message text=${JSON.stringify(text)} isMatchCommand=${isMatchCmd} hasActiveFlow=${!!(data.telegramFlows || {})[flowKey(chatId, userId)]}`);
+        if (isMatchCmd) {
           await startMatchFlow(data, chatId, userId);
           changed = true;
         } else if ((data.telegramFlows || {})[flowKey(chatId, userId)]) {
