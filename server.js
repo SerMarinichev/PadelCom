@@ -70,6 +70,14 @@ const MATCH_FLOW_STEPS = ["type", "p1a", "p1b", "p2a", "p2b", "score"];
 // retry arriving before the first delivery's save had completed). Render's free
 // tier runs this as a single process, so a plain in-memory Set is sufficient.
 const seenTelegramUpdateIds = new Set();
+// All webhook updates are chained through this single promise, one at a time —
+// even though Node accepts requests concurrently, each update's load→process→save
+// cycle now only starts once the previous one has fully finished. Must live at
+// true module scope (not inside the per-request handler below, which re-runs for
+// every request) — otherwise each request would get its own fresh, already-resolved
+// queue and never actually wait for the previous one, which is exactly what let two
+// genuinely different button taps race and silently drop a player from the flow.
+let telegramWebhookQueue = Promise.resolve();
 function flowKey(chatId) { return `${chatId}`; }
 
 async function startMatchFlow(data, chatId, userId, starterName) {
@@ -713,41 +721,7 @@ const server = http.createServer(async (req, res) => {
 
   // Public endpoint — Telegram calls this. Protected by the secret_token header instead
   // of our usual session auth, since Telegram itself (not a logged-in admin) is the caller.
-  if (url === "/api/telegram/webhook" && req.method === "POST") {
-    console.log(`[telegram webhook] incoming request at ${new Date().toISOString()}`);
-    if (req.headers["x-telegram-bot-api-secret-token"] !== TELEGRAM_WEBHOOK_SECRET) {
-      console.log(`[telegram webhook] REJECTED — secret token mismatch (got: ${JSON.stringify(req.headers["x-telegram-bot-api-secret-token"])})`);
-      send(res, 401, "not telegram", { "Content-Type": "text/plain" });
-      return;
-    }
-    try {
-      const update = await readJsonBody(req);
-      console.log(`[telegram webhook] accepted — update type: ${Object.keys(update).find((k) => k !== "update_id")} update_id=${update.update_id}`);
-
-      // Idempotency guard, checked FIRST and synchronously (before the slow GitHub
-      // load/save round-trip below even starts): each step of the /матч flow does
-      // a full read-process-write cycle against GitHub. If that takes longer than
-      // Telegram's own retry window, Telegram re-sends the SAME update — without
-      // this guard, that re-delivery would silently replay a button tap or command
-      // a second time, which is exactly what caused a flow to skip a player (one
-      // tap advanced the flow two steps instead of one). Kept in memory rather than
-      // in the GitHub-backed data on purpose: a storage-backed check would itself
-      // be racy against a retry that arrives before the first delivery's save has
-      // completed, whereas this in-memory check is instant and closes that window
-      // completely (this process runs as a single instance on Render's free tier).
-      if (update.update_id != null) {
-        if (seenTelegramUpdateIds.has(update.update_id)) {
-          console.log(`[telegram webhook] DUPLICATE update_id=${update.update_id} — ignoring re-delivery`);
-          send(res, 200, "OK", { "Content-Type": "text/plain" });
-          return;
-        }
-        seenTelegramUpdateIds.add(update.update_id);
-        if (seenTelegramUpdateIds.size > 200) {
-          const first = seenTelegramUpdateIds.values().next().value;
-          seenTelegramUpdateIds.delete(first);
-        }
-      }
-
+async function processTelegramUpdate(update) {
       const data = await loadBlob();
       let changed = false;
 
@@ -833,6 +807,37 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (changed) await saveBlob(data);
+}
+
+  if (url === "/api/telegram/webhook" && req.method === "POST") {
+    console.log(`[telegram webhook] incoming request at ${new Date().toISOString()}`);
+    if (req.headers["x-telegram-bot-api-secret-token"] !== TELEGRAM_WEBHOOK_SECRET) {
+      console.log(`[telegram webhook] REJECTED — secret token mismatch (got: ${JSON.stringify(req.headers["x-telegram-bot-api-secret-token"])})`);
+      send(res, 401, "not telegram", { "Content-Type": "text/plain" });
+      return;
+    }
+    try {
+      const update = await readJsonBody(req);
+      console.log(`[telegram webhook] accepted — update type: ${Object.keys(update).find((k) => k !== "update_id")} update_id=${update.update_id}`);
+
+      // Idempotency guard against Telegram re-delivering the exact same update
+      // (e.g. if a prior response was slow) — checked instantly, in memory.
+      if (update.update_id != null) {
+        if (seenTelegramUpdateIds.has(update.update_id)) {
+          console.log(`[telegram webhook] DUPLICATE update_id=${update.update_id} — ignoring re-delivery`);
+          send(res, 200, "OK", { "Content-Type": "text/plain" });
+          return;
+        }
+        seenTelegramUpdateIds.add(update.update_id);
+        if (seenTelegramUpdateIds.size > 200) {
+          const first = seenTelegramUpdateIds.values().next().value;
+          seenTelegramUpdateIds.delete(first);
+        }
+      }
+
+      const task = telegramWebhookQueue.then(() => processTelegramUpdate(update));
+      telegramWebhookQueue = task.catch(() => {}); // keep the chain alive even if this update errors
+      await task;
       send(res, 200, "OK", { "Content-Type": "text/plain" });
     } catch (e) {
       console.error("telegram webhook error:", e);
