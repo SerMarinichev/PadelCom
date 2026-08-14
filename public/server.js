@@ -692,12 +692,15 @@ const server = http.createServer(async (req, res) => {
   // Public endpoint — Telegram calls this. Protected by the secret_token header instead
   // of our usual session auth, since Telegram itself (not a logged-in admin) is the caller.
   if (url === "/api/telegram/webhook" && req.method === "POST") {
+    console.log(`[telegram webhook] incoming request at ${new Date().toISOString()}`);
     if (req.headers["x-telegram-bot-api-secret-token"] !== TELEGRAM_WEBHOOK_SECRET) {
+      console.log(`[telegram webhook] REJECTED — secret token mismatch (got: ${JSON.stringify(req.headers["x-telegram-bot-api-secret-token"])})`);
       send(res, 401, "not telegram", { "Content-Type": "text/plain" });
       return;
     }
     try {
       const update = await readJsonBody(req);
+      console.log(`[telegram webhook] accepted — update type: ${Object.keys(update).find((k) => k !== "update_id")}`);
       const data = await loadBlob();
       let changed = false;
 
