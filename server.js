@@ -79,10 +79,19 @@ const seenTelegramUpdateIds = new Set();
 // genuinely different button taps race and silently drop a player from the flow.
 let telegramWebhookQueue = Promise.resolve();
 function flowKey(chatId) { return `${chatId}`; }
+// In-memory, not GitHub-backed — deliberately. The step-by-step player selection
+// is transient conversation state that only matters for the few seconds it takes
+// someone to tap through it; it never needs to survive a restart. Keeping it here
+// instead of round-tripping through GitHub on every single tap is what actually
+// fixes the "player got dropped" bug at its root, rather than just papering over
+// the race with locks: there is no slow, remote read-modify-write cycle in the
+// middle of the flow for two taps to race against anymore. The player list itself
+// (names, ids) is captured into the flow once at /матч time, so later steps don't
+// need to touch storage at all — only the final score does.
+const telegramFlows = new Map();
 
-async function startMatchFlow(data, chatId, userId, starterName) {
-  data.telegramFlows = data.telegramFlows || {};
-  const existing = data.telegramFlows[flowKey(chatId)];
+async function startMatchFlow(data, chatId, starterName) {
+  const existing = telegramFlows.get(flowKey(chatId));
   if (existing) {
     await telegramCall("sendMessage", { chat_id: chatId, text: `Уже есть матч в процессе записи (начал ${existing.starterName || "кто-то"}) — закончите его или отправьте /отмена, чтобы начать заново.` });
     return "refused — a flow is already active in this chat";
@@ -102,11 +111,15 @@ async function startMatchFlow(data, chatId, userId, starterName) {
     await telegramCall("sendMessage", { chat_id: chatId, text: `В событии «${session.type || "Падел"}» пока отмечено меньше 2 участников — добавьте их в приложении, затем повторите /матч.` });
     return `session found but only ${participantIds.length} participants`;
   }
+  // Snapshot the participants' names right now, so every later step (button taps)
+  // reads only from this in-memory copy — no further storage reads needed until
+  // the very end.
+  const players = participantIds.map((id) => (data.players || []).find((p) => p.id === id)).filter(Boolean);
   // Scoped to the CHAT, not the individual sender — this is a shared group activity,
   // so any participant should be able to tap the buttons and carry the flow forward,
   // not just whoever happened to type /матч first.
-  const flow = { step: "type", sessionId: session.id, matchType: null, p1: [], p2: [], participantIds, starterName };
-  data.telegramFlows[flowKey(chatId)] = flow;
+  const flow = { step: "type", sessionId: session.id, matchType: null, p1: [], p2: [], players, starterName };
+  telegramFlows.set(flowKey(chatId), flow);
   const msg = await telegramCall("sendMessage", {
     chat_id: chatId, text: "Записываю матч 🏓\nОдиночный или парный?",
     reply_markup: { inline_keyboard: [[{ text: "Одиночный", callback_data: "mf:type:single" }, { text: "Парный", callback_data: "mf:type:double" }]] },
@@ -115,12 +128,12 @@ async function startMatchFlow(data, chatId, userId, starterName) {
   return `ok — sent buttons message_id=${msg.message_id}`;
 }
 
-function cancelMatchFlow(data, chatId) {
-  if (data.telegramFlows) delete data.telegramFlows[flowKey(chatId)];
+function cancelMatchFlow(chatId) {
+  telegramFlows.delete(flowKey(chatId));
 }
 
-function playerButtons(data, ids, prefix) {
-  const players = ids.map((id) => (data.players || []).find((p) => p.id === id)).filter(Boolean);
+function playerButtons(flow, ids, prefix) {
+  const players = ids.map((id) => flow.players.find((p) => p.id === id)).filter(Boolean);
   const rows = [];
   for (let i = 0; i < players.length; i += 2) {
     rows.push(players.slice(i, i + 2).map((p) => ({ text: playerName(p), callback_data: `mf:${prefix}:${p.id}` })));
@@ -128,74 +141,78 @@ function playerButtons(data, ids, prefix) {
   return rows;
 }
 
-async function advanceMatchFlow(data, chatId, action) {
-  const key = flowKey(chatId);
-  const flow = (data.telegramFlows || {})[key];
+async function advanceMatchFlow(chatId, action) {
+  const flow = telegramFlows.get(flowKey(chatId));
   if (!flow) return;
-  const remaining = () => flow.participantIds.filter((id) => !flow.p1.includes(id) && !flow.p2.includes(id));
+  const remaining = () => flow.players.map((p) => p.id).filter((id) => !flow.p1.includes(id) && !flow.p2.includes(id));
+  const nameOf = (id) => playerName(flow.players.find((p) => p.id === id) || {});
   const editText = async (text, keyboard) => {
     await telegramCall("editMessageText", { chat_id: chatId, message_id: flow.messageId, text, reply_markup: keyboard ? { inline_keyboard: keyboard } : undefined }).catch(() => {});
   };
 
+  // Every branch below is synchronous right up until its own `await editText(...)`,
+  // so even if two taps for this same flow land back-to-back, the state mutation
+  // itself (flow.p1 = ..., flow.p1.push(...)) can never be interleaved by the other.
   if (action.startsWith("type:")) {
     flow.matchType = action.slice(5);
     flow.step = "p1a";
-    await editText(`Участник 1${flow.matchType === "double" ? " — игрок 1" : ""}:`, playerButtons(data, remaining(), "p1a"));
+    await editText(`Участник 1${flow.matchType === "double" ? " — игрок 1" : ""}:`, playerButtons(flow, remaining(), "p1a"));
     return;
   }
   if (action.startsWith("p1a:")) {
     flow.p1 = [action.slice(4)];
     if (flow.matchType === "double") {
       flow.step = "p1b";
-      await editText("Участник 1 — игрок 2:", playerButtons(data, remaining(), "p1b"));
+      await editText("Участник 1 — игрок 2:", playerButtons(flow, remaining(), "p1b"));
     } else {
       flow.step = "p2a";
-      await editText("Участник 2:", playerButtons(data, remaining(), "p2a"));
+      await editText("Участник 2:", playerButtons(flow, remaining(), "p2a"));
     }
     return;
   }
   if (action.startsWith("p1b:")) {
     flow.p1.push(action.slice(4));
     flow.step = "p2a";
-    await editText("Участник 2 — игрок 1:", playerButtons(data, remaining(), "p2a"));
+    await editText("Участник 2 — игрок 1:", playerButtons(flow, remaining(), "p2a"));
     return;
   }
   if (action.startsWith("p2a:")) {
     flow.p2 = [action.slice(4)];
     if (flow.matchType === "double") {
       flow.step = "p2b";
-      await editText("Участник 2 — игрок 2:", playerButtons(data, remaining(), "p2b"));
+      await editText("Участник 2 — игрок 2:", playerButtons(flow, remaining(), "p2b"));
     } else {
       flow.step = "score";
-      await editText(`${flow.p1.map((id) => playerName((data.players || []).find((p) => p.id === id) || {})).join(" / ")} vs ${flow.p2.map((id) => playerName((data.players || []).find((p) => p.id === id) || {})).join(" / ")}\n\nПришлите счёт в формате 6:3`);
+      await editText(`${flow.p1.map(nameOf).join(" / ")} vs ${flow.p2.map(nameOf).join(" / ")}\n\nПришлите счёт в формате 6:3`);
     }
     return;
   }
   if (action.startsWith("p2b:")) {
     flow.p2.push(action.slice(4));
     flow.step = "score";
-    const nm = (id) => playerName((data.players || []).find((p) => p.id === id) || {});
-    await editText(`${flow.p1.map(nm).join(" / ")} vs ${flow.p2.map(nm).join(" / ")}\n\nПришлите счёт в формате 6:3`);
+    await editText(`${flow.p1.map(nameOf).join(" / ")} vs ${flow.p2.map(nameOf).join(" / ")}\n\nПришлите счёт в формате 6:3`);
     return;
   }
 }
 
 async function finishMatchFlow(data, chatId, text) {
-  const key = flowKey(chatId);
-  const flow = (data.telegramFlows || {})[key];
+  const flow = telegramFlows.get(flowKey(chatId));
   if (!flow || flow.step !== "score") return false;
   const m = text.trim().match(/^(\d+)\s*[:\-–]\s*(\d+)$/);
   if (!m) {
     await telegramCall("sendMessage", { chat_id: chatId, text: "Не понял счёт — пришлите в формате 6:3" }).catch(() => {});
     return true;
   }
-  const nameOf = (id) => playerName((data.players || []).find((p) => p.id === id) || {});
+  const nameOf = (id) => playerName(flow.players.find((p) => p.id === id) || {});
+  // The ONE point in the whole flow that actually needs to touch storage — reuses
+  // the caller's already-loaded data so there's still only a single load/save per
+  // webhook update, not a second one racing against it.
   data.matchRecords = data.matchRecords || [];
   data.matchRecords.push({
     id: crypto.randomUUID().slice(0, 8), date: todayISOServer(), matchType: flow.matchType, sessionId: flow.sessionId,
     participant1: flow.p1, participant2: flow.p2, score1: parseInt(m[1], 10), score2: parseInt(m[2], 10),
   });
-  delete data.telegramFlows[key];
+  telegramFlows.delete(flowKey(chatId));
   await telegramCall("sendMessage", { chat_id: chatId, text: `Записал ✓\n${flow.p1.map(nameOf).join(" / ")} ${m[1]} : ${m[2]} ${flow.p2.map(nameOf).join(" / ")}` }).catch(() => {});
   return true;
 }
@@ -756,19 +773,19 @@ async function processTelegramUpdate(update) {
         const isMatchCmd = /^\/(матч|match)(@\w+)?/i.test(text);
         const isCancelCmd = /^\/(отмена|cancel)(@\w+)?/i.test(text);
         data.telegramMatchDebug = { text, isMatchCmd, at: new Date().toISOString(), result: "" };
-        console.log(`[telegram webhook] message text=${JSON.stringify(text)} isMatchCommand=${isMatchCmd} hasActiveFlow=${!!(data.telegramFlows || {})[flowKey(chatId)]}`);
+        console.log(`[telegram webhook] message text=${JSON.stringify(text)} isMatchCommand=${isMatchCmd} hasActiveFlow=${telegramFlows.has(flowKey(chatId))}`);
         if (isCancelCmd) {
-          cancelMatchFlow(data, chatId);
+          cancelMatchFlow(chatId);
           await telegramCall("sendMessage", { chat_id: chatId, text: "Отменил запись матча." }).catch(() => {});
           changed = true;
         } else if (isMatchCmd) {
           try {
-            data.telegramMatchDebug.result = await startMatchFlow(data, chatId, fromUser.id, starterName);
+            data.telegramMatchDebug.result = await startMatchFlow(data, chatId, starterName);
           } catch (flowErr) {
             data.telegramMatchDebug.result = `error: ${String(flowErr.message || flowErr)}`;
           }
           changed = true;
-        } else if ((data.telegramFlows || {})[flowKey(chatId)]) {
+        } else if (telegramFlows.has(flowKey(chatId))) {
           const handled = await finishMatchFlow(data, chatId, text);
           if (handled) changed = true;
         }
@@ -777,13 +794,12 @@ async function processTelegramUpdate(update) {
       // Inline keyboard button taps for the /матч flow — any participant in the chat
       // can advance it, not just whoever originally typed /матч (this is a shared,
       // group activity — restricting it to one person caused taps to silently do
-      // nothing for everyone else).
+      // nothing for everyone else). Purely in-memory — does not touch storage.
       if (update.callback_query && typeof update.callback_query.data === "string" && update.callback_query.data.startsWith("mf:")) {
         const cq = update.callback_query;
         const chatId = cq.message.chat.id;
         await telegramCall("answerCallbackQuery", { callback_query_id: cq.id }).catch(() => {});
-        await advanceMatchFlow(data, chatId, cq.data.slice(3));
-        changed = true;
+        await advanceMatchFlow(chatId, cq.data.slice(3));
       }
 
       // A poll answer: match it back to a PadelCom poll + player by Telegram @username.
