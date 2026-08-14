@@ -20,7 +20,8 @@ const SESSION_SECRET = process.env.SESSION_SECRET || ADMIN_PASSWORD || "padelcom
 
 // ---- Telegram bot (optional: only active if TELEGRAM_BOT_TOKEN is set) ----
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}` : null;
+const TELEGRAM_API_BASE = process.env.TELEGRAM_API_BASE || "https://api.telegram.org";
+const TELEGRAM_API = TELEGRAM_BOT_TOKEN ? `${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}` : null;
 // Verifies incoming webhook calls really come from Telegram (via the secret_token header
 // Telegram echoes back on every request once configured via setWebhook).
 const TELEGRAM_WEBHOOK_SECRET = crypto.createHash("sha256").update(TELEGRAM_BOT_TOKEN || "none").digest("hex").slice(0, 32);
@@ -34,6 +35,142 @@ async function telegramCall(method, body) {
   const data = await r.json();
   if (!data.ok) throw new Error(data.description || "Telegram API error");
   return data.result;
+}
+
+// ---- /match conversational flow (Telegram bot) ----
+// Mirrors the exact same participant-narrowing logic already used in the app's
+// match form: only players who are actually part of TODAY's event are offered,
+// and each pick removes that player from the remaining button choices.
+function resolveParticipantsServer(splitAmong, pairs) {
+  const set = new Set();
+  (splitAmong || []).forEach((token) => {
+    if (typeof token === "string" && token.startsWith("pair:")) {
+      const primaryId = token.slice(5);
+      const pr = (pairs || []).find((x) => x.primaryId === primaryId);
+      if (pr) { set.add(pr.primaryId); set.add(pr.secondaryId); } else set.add(primaryId);
+    } else {
+      set.add(token);
+    }
+  });
+  return [...set];
+}
+function sessionParticipantIdsServer(s, pairs) {
+  const set = new Set();
+  (s.expenses || []).forEach((e) => resolveParticipantsServer(e.splitAmong, pairs).forEach((id) => set.add(id)));
+  return [...set];
+}
+function playerName(p) { return [p.firstName, p.lastName].filter(Boolean).join(" ").trim() || "Без имени"; }
+function todayISOServer() { return new Date().toISOString().slice(0, 10); }
+
+const MATCH_FLOW_STEPS = ["type", "p1a", "p1b", "p2a", "p2b", "score"];
+function flowKey(chatId, userId) { return `${chatId}:${userId}`; }
+
+async function startMatchFlow(data, chatId, userId) {
+  const today = todayISOServer();
+  const sessions = (data.sessions || []).filter((s) => s.date === today);
+  console.log(`[startMatchFlow] today=${today} sessionsFound=${sessions.length} totalSessionsInData=${(data.sessions || []).length}`);
+  if (sessions.length === 0) {
+    await telegramCall("sendMessage", { chat_id: chatId, text: "На сегодня не нашёл событие в PadelCom — сначала создайте его в приложении." });
+    return `no session for ${today} (${(data.sessions || []).length} total sessions in data)`;
+  }
+  // If more than one event today, just use the first — keeps the flow simple;
+  // rare edge case for a padel group with more than one session per day.
+  const session = sessions[0];
+  const participantIds = sessionParticipantIdsServer(session, data.pairs || []);
+  if (participantIds.length < 2) {
+    await telegramCall("sendMessage", { chat_id: chatId, text: `В событии «${session.type || "Падел"}» пока отмечено меньше 2 участников — добавьте их в приложении, затем повторите /матч.` });
+    return `session found but only ${participantIds.length} participants`;
+  }
+  const flow = { step: "type", sessionId: session.id, matchType: null, p1: [], p2: [], participantIds };
+  data.telegramFlows = data.telegramFlows || {};
+  data.telegramFlows[flowKey(chatId, userId)] = flow;
+  const msg = await telegramCall("sendMessage", {
+    chat_id: chatId, text: "Записываю матч 🏓\nОдиночный или парный?",
+    reply_markup: { inline_keyboard: [[{ text: "Одиночный", callback_data: "mf:type:single" }, { text: "Парный", callback_data: "mf:type:double" }]] },
+  });
+  flow.messageId = msg.message_id;
+  return `ok — sent buttons message_id=${msg.message_id}`;
+}
+
+function playerButtons(data, ids, prefix) {
+  const players = ids.map((id) => (data.players || []).find((p) => p.id === id)).filter(Boolean);
+  const rows = [];
+  for (let i = 0; i < players.length; i += 2) {
+    rows.push(players.slice(i, i + 2).map((p) => ({ text: playerName(p), callback_data: `mf:${prefix}:${p.id}` })));
+  }
+  return rows;
+}
+
+async function advanceMatchFlow(data, chatId, userId, action) {
+  const key = flowKey(chatId, userId);
+  const flow = (data.telegramFlows || {})[key];
+  if (!flow) return;
+  const remaining = () => flow.participantIds.filter((id) => !flow.p1.includes(id) && !flow.p2.includes(id));
+  const editText = async (text, keyboard) => {
+    await telegramCall("editMessageText", { chat_id: chatId, message_id: flow.messageId, text, reply_markup: keyboard ? { inline_keyboard: keyboard } : undefined }).catch(() => {});
+  };
+
+  if (action.startsWith("type:")) {
+    flow.matchType = action.slice(5);
+    flow.step = "p1a";
+    await editText(`Участник 1${flow.matchType === "double" ? " — игрок 1" : ""}:`, playerButtons(data, remaining(), "p1a"));
+    return;
+  }
+  if (action.startsWith("p1a:")) {
+    flow.p1 = [action.slice(4)];
+    if (flow.matchType === "double") {
+      flow.step = "p1b";
+      await editText("Участник 1 — игрок 2:", playerButtons(data, remaining(), "p1b"));
+    } else {
+      flow.step = "p2a";
+      await editText("Участник 2:", playerButtons(data, remaining(), "p2a"));
+    }
+    return;
+  }
+  if (action.startsWith("p1b:")) {
+    flow.p1.push(action.slice(4));
+    flow.step = "p2a";
+    await editText("Участник 2 — игрок 1:", playerButtons(data, remaining(), "p2a"));
+    return;
+  }
+  if (action.startsWith("p2a:")) {
+    flow.p2 = [action.slice(4)];
+    if (flow.matchType === "double") {
+      flow.step = "p2b";
+      await editText("Участник 2 — игрок 2:", playerButtons(data, remaining(), "p2b"));
+    } else {
+      flow.step = "score";
+      await editText(`${flow.p1.map((id) => playerName((data.players || []).find((p) => p.id === id) || {})).join(" / ")} vs ${flow.p2.map((id) => playerName((data.players || []).find((p) => p.id === id) || {})).join(" / ")}\n\nПришлите счёт в формате 6:3`);
+    }
+    return;
+  }
+  if (action.startsWith("p2b:")) {
+    flow.p2.push(action.slice(4));
+    flow.step = "score";
+    const nm = (id) => playerName((data.players || []).find((p) => p.id === id) || {});
+    await editText(`${flow.p1.map(nm).join(" / ")} vs ${flow.p2.map(nm).join(" / ")}\n\nПришлите счёт в формате 6:3`);
+    return;
+  }
+}
+
+async function finishMatchFlow(data, chatId, userId, text) {
+  const key = flowKey(chatId, userId);
+  const flow = (data.telegramFlows || {})[key];
+  if (!flow || flow.step !== "score") return false;
+  const m = text.trim().match(/^(\d+)\s*[:\-–]\s*(\d+)$/);
+  if (!m) {
+    await telegramCall("sendMessage", { chat_id: chatId, text: "Не понял счёт — пришлите в формате 6:3" }).catch(() => {});
+    return true;
+  }
+  const nameOf = (id) => playerName((data.players || []).find((p) => p.id === id) || {});
+  data.matchRecords = data.matchRecords || [];
+  data.matchRecords.push({
+    id: crypto.randomUUID().slice(0, 8), date: todayISOServer(), matchType: flow.matchType, sessionId: flow.sessionId,
+    participant1: flow.p1, participant2: flow.p2, score1: parseInt(m[1], 10), score2: parseInt(m[2], 10),
+  });
+  delete data.telegramFlows[key];
+  await telegramCall("sendMessage", { chat_id: chatId, text: `Записал ✓\n${flow.p1.map(nameOf).join(" / ")} ${m[1]} : ${m[2]} ${flow.p2.map(nameOf).join(" / ")}` }).catch(() => {});
+  return true;
 }
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const COOKIE_NAME = "padelcom_admin";
@@ -491,6 +628,7 @@ const server = http.createServer(async (req, res) => {
         lastDeliveryError: info ? info.last_error_message : "",
         lastDeliveryErrorAt: info && info.last_error_date ? new Date(info.last_error_date * 1000).toISOString() : "",
         lastEvent: data.telegramLastEvent || null,
+        matchDebug: data.telegramMatchDebug || null,
         chats: data.telegramChats || [],
         selectedChatId: data.telegramChatId || "",
       }), { "Content-Type": "application/json" });
@@ -508,7 +646,7 @@ const server = http.createServer(async (req, res) => {
       await telegramCall("setWebhook", {
         url: `${baseUrl.replace(/\/$/, "")}/api/telegram/webhook`,
         secret_token: TELEGRAM_WEBHOOK_SECRET,
-        allowed_updates: ["message", "poll_answer"],
+        allowed_updates: ["message", "poll_answer", "callback_query"],
       });
       send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
     } catch (e) {
@@ -557,19 +695,24 @@ const server = http.createServer(async (req, res) => {
   // Public endpoint — Telegram calls this. Protected by the secret_token header instead
   // of our usual session auth, since Telegram itself (not a logged-in admin) is the caller.
   if (url === "/api/telegram/webhook" && req.method === "POST") {
+    console.log(`[telegram webhook] incoming request at ${new Date().toISOString()}`);
     if (req.headers["x-telegram-bot-api-secret-token"] !== TELEGRAM_WEBHOOK_SECRET) {
+      console.log(`[telegram webhook] REJECTED — secret token mismatch (got: ${JSON.stringify(req.headers["x-telegram-bot-api-secret-token"])})`);
       send(res, 401, "not telegram", { "Content-Type": "text/plain" });
       return;
     }
     try {
       const update = await readJsonBody(req);
+      console.log(`[telegram webhook] accepted — update type: ${Object.keys(update).find((k) => k !== "update_id")}`);
       const data = await loadBlob();
       let changed = false;
 
       // Diagnostic breadcrumb: record that *something* reached us, regardless of type,
       // so the admin panel can show "last event received at ..." — this is the fastest
       // way to tell a Telegram-side problem (privacy mode, webhook not registered) apart
-      // from a server-side one (chat/poll matching, storage save failing).
+      // from a server-side one (chat/poll matching, storage save failing). Kept here
+      // (not just in Render's own logs) because that log viewer has repeatedly proven
+      // awkward to read live — the admin panel is a more reliable channel for this.
       data.telegramLastEvent = { type: Object.keys(update).find((k) => k !== "update_id") || "unknown", at: new Date().toISOString() };
       changed = true;
 
@@ -582,6 +725,37 @@ const server = http.createServer(async (req, res) => {
         const title = chat.title || [chat.first_name, chat.last_name].filter(Boolean).join(" ") || chat.username || String(chat.id);
         if (existing) existing.title = title;
         else data.telegramChats.push({ id: chat.id, title });
+        changed = true;
+      }
+
+      // /матч (or /match) command: starts the step-by-step "add a match" bot flow.
+      if (update.message && typeof update.message.text === "string") {
+        const text = update.message.text.trim();
+        const chatId = update.message.chat.id;
+        const userId = update.message.from.id;
+        const isMatchCmd = /^\/(матч|match)(@\w+)?/i.test(text);
+        data.telegramMatchDebug = { text, isMatchCmd, at: new Date().toISOString(), result: "" };
+        console.log(`[telegram webhook] message text=${JSON.stringify(text)} isMatchCommand=${isMatchCmd} hasActiveFlow=${!!(data.telegramFlows || {})[flowKey(chatId, userId)]}`);
+        if (isMatchCmd) {
+          try {
+            data.telegramMatchDebug.result = await startMatchFlow(data, chatId, userId);
+          } catch (flowErr) {
+            data.telegramMatchDebug.result = `error: ${String(flowErr.message || flowErr)}`;
+          }
+          changed = true;
+        } else if ((data.telegramFlows || {})[flowKey(chatId, userId)]) {
+          const handled = await finishMatchFlow(data, chatId, userId, text);
+          if (handled) changed = true;
+        }
+      }
+
+      // Inline keyboard button taps for the /матч flow.
+      if (update.callback_query && typeof update.callback_query.data === "string" && update.callback_query.data.startsWith("mf:")) {
+        const cq = update.callback_query;
+        const chatId = cq.message.chat.id;
+        const userId = cq.from.id;
+        await telegramCall("answerCallbackQuery", { callback_query_id: cq.id }).catch(() => {});
+        await advanceMatchFlow(data, chatId, userId, cq.data.slice(3));
         changed = true;
       }
 
