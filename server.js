@@ -63,9 +63,15 @@ function playerName(p) { return [p.firstName, p.lastName].filter(Boolean).join("
 function todayISOServer() { return new Date().toISOString().slice(0, 10); }
 
 const MATCH_FLOW_STEPS = ["type", "p1a", "p1b", "p2a", "p2b", "score"];
-function flowKey(chatId, userId) { return `${chatId}:${userId}`; }
+function flowKey(chatId) { return `${chatId}`; }
 
-async function startMatchFlow(data, chatId, userId) {
+async function startMatchFlow(data, chatId, userId, starterName) {
+  data.telegramFlows = data.telegramFlows || {};
+  const existing = data.telegramFlows[flowKey(chatId)];
+  if (existing) {
+    await telegramCall("sendMessage", { chat_id: chatId, text: `Уже есть матч в процессе записи (начал ${existing.starterName || "кто-то"}) — закончите его или отправьте /отмена, чтобы начать заново.` });
+    return "refused — a flow is already active in this chat";
+  }
   const today = todayISOServer();
   const sessions = (data.sessions || []).filter((s) => s.date === today);
   console.log(`[startMatchFlow] today=${today} sessionsFound=${sessions.length} totalSessionsInData=${(data.sessions || []).length}`);
@@ -81,15 +87,21 @@ async function startMatchFlow(data, chatId, userId) {
     await telegramCall("sendMessage", { chat_id: chatId, text: `В событии «${session.type || "Падел"}» пока отмечено меньше 2 участников — добавьте их в приложении, затем повторите /матч.` });
     return `session found but only ${participantIds.length} participants`;
   }
-  const flow = { step: "type", sessionId: session.id, matchType: null, p1: [], p2: [], participantIds };
-  data.telegramFlows = data.telegramFlows || {};
-  data.telegramFlows[flowKey(chatId, userId)] = flow;
+  // Scoped to the CHAT, not the individual sender — this is a shared group activity,
+  // so any participant should be able to tap the buttons and carry the flow forward,
+  // not just whoever happened to type /матч first.
+  const flow = { step: "type", sessionId: session.id, matchType: null, p1: [], p2: [], participantIds, starterName };
+  data.telegramFlows[flowKey(chatId)] = flow;
   const msg = await telegramCall("sendMessage", {
     chat_id: chatId, text: "Записываю матч 🏓\nОдиночный или парный?",
     reply_markup: { inline_keyboard: [[{ text: "Одиночный", callback_data: "mf:type:single" }, { text: "Парный", callback_data: "mf:type:double" }]] },
   });
   flow.messageId = msg.message_id;
   return `ok — sent buttons message_id=${msg.message_id}`;
+}
+
+function cancelMatchFlow(data, chatId) {
+  if (data.telegramFlows) delete data.telegramFlows[flowKey(chatId)];
 }
 
 function playerButtons(data, ids, prefix) {
@@ -101,8 +113,8 @@ function playerButtons(data, ids, prefix) {
   return rows;
 }
 
-async function advanceMatchFlow(data, chatId, userId, action) {
-  const key = flowKey(chatId, userId);
+async function advanceMatchFlow(data, chatId, action) {
+  const key = flowKey(chatId);
   const flow = (data.telegramFlows || {})[key];
   if (!flow) return;
   const remaining = () => flow.participantIds.filter((id) => !flow.p1.includes(id) && !flow.p2.includes(id));
@@ -153,8 +165,8 @@ async function advanceMatchFlow(data, chatId, userId, action) {
   }
 }
 
-async function finishMatchFlow(data, chatId, userId, text) {
-  const key = flowKey(chatId, userId);
+async function finishMatchFlow(data, chatId, text) {
+  const key = flowKey(chatId);
   const flow = (data.telegramFlows || {})[key];
   if (!flow || flow.step !== "score") return false;
   const m = text.trim().match(/^(\d+)\s*[:\-–]\s*(\d+)$/);
@@ -729,33 +741,42 @@ const server = http.createServer(async (req, res) => {
       }
 
       // /матч (or /match) command: starts the step-by-step "add a match" bot flow.
+      // /отмена (or /cancel): clears a stuck or wrong flow so the chat can start over.
       if (update.message && typeof update.message.text === "string") {
         const text = update.message.text.trim();
         const chatId = update.message.chat.id;
-        const userId = update.message.from.id;
+        const fromUser = update.message.from;
+        const starterName = [fromUser.first_name, fromUser.last_name].filter(Boolean).join(" ") || fromUser.username || "кто-то";
         const isMatchCmd = /^\/(матч|match)(@\w+)?/i.test(text);
+        const isCancelCmd = /^\/(отмена|cancel)(@\w+)?/i.test(text);
         data.telegramMatchDebug = { text, isMatchCmd, at: new Date().toISOString(), result: "" };
-        console.log(`[telegram webhook] message text=${JSON.stringify(text)} isMatchCommand=${isMatchCmd} hasActiveFlow=${!!(data.telegramFlows || {})[flowKey(chatId, userId)]}`);
-        if (isMatchCmd) {
+        console.log(`[telegram webhook] message text=${JSON.stringify(text)} isMatchCommand=${isMatchCmd} hasActiveFlow=${!!(data.telegramFlows || {})[flowKey(chatId)]}`);
+        if (isCancelCmd) {
+          cancelMatchFlow(data, chatId);
+          await telegramCall("sendMessage", { chat_id: chatId, text: "Отменил запись матча." }).catch(() => {});
+          changed = true;
+        } else if (isMatchCmd) {
           try {
-            data.telegramMatchDebug.result = await startMatchFlow(data, chatId, userId);
+            data.telegramMatchDebug.result = await startMatchFlow(data, chatId, fromUser.id, starterName);
           } catch (flowErr) {
             data.telegramMatchDebug.result = `error: ${String(flowErr.message || flowErr)}`;
           }
           changed = true;
-        } else if ((data.telegramFlows || {})[flowKey(chatId, userId)]) {
-          const handled = await finishMatchFlow(data, chatId, userId, text);
+        } else if ((data.telegramFlows || {})[flowKey(chatId)]) {
+          const handled = await finishMatchFlow(data, chatId, text);
           if (handled) changed = true;
         }
       }
 
-      // Inline keyboard button taps for the /матч flow.
+      // Inline keyboard button taps for the /матч flow — any participant in the chat
+      // can advance it, not just whoever originally typed /матч (this is a shared,
+      // group activity — restricting it to one person caused taps to silently do
+      // nothing for everyone else).
       if (update.callback_query && typeof update.callback_query.data === "string" && update.callback_query.data.startsWith("mf:")) {
         const cq = update.callback_query;
         const chatId = cq.message.chat.id;
-        const userId = cq.from.id;
         await telegramCall("answerCallbackQuery", { callback_query_id: cq.id }).catch(() => {});
-        await advanceMatchFlow(data, chatId, userId, cq.data.slice(3));
+        await advanceMatchFlow(data, chatId, cq.data.slice(3));
         changed = true;
       }
 
