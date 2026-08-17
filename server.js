@@ -317,6 +317,11 @@ async function githubRequest(method, apiPath, body) {
   return r;
 }
 
+// All GitHub saves (from anywhere in the server) are chained through this single
+// promise, one at a time — see saveBlob() below for why this needs to live here,
+// at true module scope, rather than inside any per-request handler.
+let githubSaveQueue = Promise.resolve();
+
 async function loadBlob() {
   if (!githubConfigured()) throw new Error("GITHUB_TOKEN / GITHUB_REPO не настроены");
   const r = await githubRequest("GET", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`);
@@ -331,6 +336,32 @@ async function loadBlob() {
 }
 
 async function saveBlob(data) {
+  // Every caller anywhere in the server — the Telegram bot, player login, admin
+  // actions, the app's own autosave — goes through this SAME queue, one write at a
+  // time. This closes the GitHub sha-conflict race for the write itself, but NOT
+  // the "lost update" race on its own — see updateBlob() below for that.
+  const task = githubSaveQueue.then(() => saveBlobInner(data));
+  githubSaveQueue = task.catch(() => {});
+  return task;
+}
+// Read-modify-write as a single, indivisible step in the queue. Using loadBlob()
+// and saveBlob() as two SEPARATE calls (even both awaited in the same handler)
+// leaves a gap: another queued write can land in between, and the "current" data
+// this handler read is then stale by the time it saves — exactly what caused a
+// Telegram login's verification flag to vanish under a concurrent app autosave.
+// Queuing the READ together with the WRITE guarantees the mutator always sees
+// every change that was queued before it, no matter how slow GitHub itself is.
+async function updateBlob(mutator) {
+  const task = githubSaveQueue.then(async () => {
+    const current = await loadBlob();
+    const next = await mutator(current);
+    if (!next) return current; // mutator signaled nothing changed — skip the write entirely
+    return saveBlobInner(next);
+  });
+  githubSaveQueue = task.catch(() => {});
+  return task;
+}
+async function saveBlobInner(data, attempt = 1) {
   if (!githubConfigured()) throw new Error("GITHUB_TOKEN / GITHUB_REPO не настроены");
   // GitHub requires the current file's sha to update it (prevents silently clobbering
   // a concurrent write) — fetch it fresh every time rather than caching in memory.
@@ -350,6 +381,14 @@ async function saveBlob(data) {
     ...(sha ? { sha } : {}),
   });
   if (!putR.ok) {
+    // The write queue (see saveBlob above) already prevents this in the normal case —
+    // this retry is a safety net for the rare remaining case of an edit made directly
+    // on GitHub itself, outside our own queue. One retry with a freshly-fetched sha is
+    // enough; if it still fails, something else is genuinely wrong and should surface.
+    if (putR.status === 409 && attempt < 3) {
+      console.log(`[saveBlob] sha conflict, retrying (attempt ${attempt + 1})`);
+      return saveBlobInner(data, attempt + 1);
+    }
     const body = await putR.text().catch(() => "");
     throw new Error(`github ${putR.status} (payload ${(payload.length / 1024).toFixed(0)}KB)${body ? `: ${body.slice(0, 300)}` : ""}`);
   }
@@ -773,8 +812,7 @@ const server = http.createServer(async (req, res) => {
 
   // Public endpoint — Telegram calls this. Protected by the secret_token header instead
   // of our usual session auth, since Telegram itself (not a logged-in admin) is the caller.
-async function processTelegramUpdate(update) {
-      const data = await loadBlob();
+async function processTelegramUpdate(update, data) {
       let changed = false;
 
       // Diagnostic breadcrumb: record that *something* reached us, regardless of type,
@@ -857,7 +895,7 @@ async function processTelegramUpdate(update) {
         }
       }
 
-      if (changed) await saveBlob(data);
+      return changed ? data : null;
 }
 
   // ---- player identity: "Войти через Telegram" (Telegram Login Widget) ----
@@ -876,28 +914,37 @@ async function processTelegramUpdate(update) {
       const payload = await readJsonBody(req);
       const check = verifyTelegramLoginPayload(payload);
       if (!check.ok) { send(res, 401, JSON.stringify({ error: check.reason }), { "Content-Type": "application/json" }); return; }
-      const data = await loadBlob();
       const tgUserId = String(payload.id);
       const tgUsername = (payload.username || "").toLowerCase();
-      let player = (data.players || []).find((p) => p.telegramUserId && String(p.telegramUserId) === tgUserId);
-      if (!player && tgUsername) {
-        player = (data.players || []).find((p) => p.telegram && p.telegram.replace(/^@/, "").toLowerCase() === tgUsername);
+      let matchedPlayer = null;
+      try {
+        await updateBlob((data) => {
+          let player = (data.players || []).find((p) => p.telegramUserId && String(p.telegramUserId) === tgUserId);
+          if (!player && tgUsername) {
+            player = (data.players || []).find((p) => p.telegram && p.telegram.replace(/^@/, "").toLowerCase() === tgUsername);
+          }
+          if (!player) { const err = new Error("no-match"); err.noMatch = true; throw err; }
+          player.telegramUserId = tgUserId;
+          player.telegramVerified = true;
+          if (tgUsername && !player.telegram) player.telegram = `@${payload.username}`;
+          matchedPlayer = player;
+          return data;
+        });
+      } catch (e) {
+        if (e.noMatch) {
+          send(res, 404, JSON.stringify({ error: "no-match", detail: "Ваш Telegram не сопоставлен ни с одним игроком. Попросите администратора указать ваш @username в карточке игрока и попробуйте снова." }), { "Content-Type": "application/json" });
+          return;
+        }
+        throw e;
       }
-      if (!player) {
-        send(res, 404, JSON.stringify({ error: "no-match", detail: "Ваш Telegram не сопоставлен ни с одним игроком. Попросите администратора указать ваш @username в карточке игрока и попробуйте снова." }), { "Content-Type": "application/json" });
-        return;
-      }
-      player.telegramUserId = tgUserId;
-      player.telegramVerified = true;
-      if (tgUsername && !player.telegram) player.telegram = `@${payload.username}`;
-      await saveBlob(data);
-      const token = makeSessionToken({ playerId: player.id, tgUserId });
-      send(res, 200, JSON.stringify({ ok: true, playerId: player.id, playerName: [player.firstName, player.lastName].filter(Boolean).join(" ") }), {
+      const token = makeSessionToken({ playerId: matchedPlayer.id, tgUserId });
+      send(res, 200, JSON.stringify({ ok: true, playerId: matchedPlayer.id, playerName: [matchedPlayer.firstName, matchedPlayer.lastName].filter(Boolean).join(" ") }), {
         "Content-Type": "application/json",
         "Set-Cookie": `${PLAYER_COOKIE_NAME}=${token}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax`,
       });
     } catch (e) {
-      send(res, 502, JSON.stringify({ error: String(e.message || e) }), { "Content-Type": "application/json" });
+      console.error("player login error:", e);
+      send(res, 502, JSON.stringify({ error: "server-error", detail: "Не удалось войти — сервер сейчас недоступен. Попробуйте ещё раз через минуту." }), { "Content-Type": "application/json" });
     }
     return;
   }
@@ -950,7 +997,7 @@ async function processTelegramUpdate(update) {
         }
       }
 
-      const task = telegramWebhookQueue.then(() => processTelegramUpdate(update));
+      const task = telegramWebhookQueue.then(() => updateBlob((data) => processTelegramUpdate(update, data)));
       telegramWebhookQueue = task.catch(() => {}); // keep the chain alive even if this update errors
       await task;
       send(res, 200, "OK", { "Content-Type": "text/plain" });
@@ -980,14 +1027,19 @@ async function processTelegramUpdate(update) {
     req.on("end", async () => {
       try {
         const incoming = JSON.parse(body); // validate
-        // Telegram-related fields are written exclusively by the webhook, out-of-band
-        // from any client. A browser tab's in-memory copy can be stale by the time it
-        // saves, and because every save overwrites the whole blob, a stale save would
-        // silently erase chats/events the webhook discovered in the meantime. Always
-        // keep the server's current values here regardless of what the client sent —
-        // no client (app or admin restore-from-backup) legitimately needs to change them.
-        try {
-          const current = await loadBlob();
+        let result = incoming;
+        await updateBlob((current) => {
+          // Telegram-related fields are written exclusively by the webhook or by
+          // "Войти через Telegram", out-of-band from any client tab. A browser tab's
+          // in-memory copy can be stale by the time it saves, and because every save
+          // overwrites the whole blob, a stale save would otherwise silently erase
+          // chats/events/verification the webhook or a login discovered in the
+          // meantime. Always keep the server's current values here regardless of
+          // what the client sent — no client legitimately needs to change them.
+          // This whole merge now runs INSIDE the same queued step as the write
+          // itself (see updateBlob), so "current" is guaranteed to already include
+          // every earlier queued change — not just whatever loadBlob happened to
+          // return before this request even reached the queue.
           incoming.telegramChats = current.telegramChats || [];
           incoming.telegramChatId = current.telegramChatId || incoming.telegramChatId || "";
           incoming.telegramLastEvent = current.telegramLastEvent || null;
@@ -1002,9 +1054,22 @@ async function processTelegramUpdate(update) {
             }
             return p;
           });
-        } catch { /* if the current copy can't be read, fall through and save as-is */ }
-        await saveBlob(incoming);
-        send(res, 200, JSON.stringify(incoming), { "Content-Type": "application/json" });
+          // Same reasoning for per-player verification: "Войти через Telegram" writes
+          // telegramVerified/telegramUserId directly on a player record, independently
+          // of any open app tab. A stale client save that doesn't know about a login
+          // that just happened would otherwise silently un-verify that player.
+          const currentPlayers = current.players || [];
+          incoming.players = (incoming.players || []).map((p) => {
+            const curPlayer = currentPlayers.find((cp) => cp.id === p.id);
+            if (curPlayer && curPlayer.telegramVerified && !p.telegramVerified) {
+              return { ...p, telegramVerified: curPlayer.telegramVerified, telegramUserId: curPlayer.telegramUserId };
+            }
+            return p;
+          });
+          result = incoming;
+          return incoming;
+        });
+        send(res, 200, JSON.stringify(result), { "Content-Type": "application/json" });
       } catch (e) {
         send(res, 502, JSON.stringify({ error: "storage save failed", detail: String(e) }), { "Content-Type": "application/json" });
       }
