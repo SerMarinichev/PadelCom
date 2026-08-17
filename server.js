@@ -37,6 +37,34 @@ async function telegramCall(method, body) {
   return data.result;
 }
 
+// ---- Telegram Login Widget (https://core.telegram.org/widgets/login) ----
+// Verifies the signed payload the widget hands back to the browser, per Telegram's
+// documented algorithm: secret_key = SHA256(bot_token); hash = HMAC-SHA256(data-check-
+// string, secret_key), where data-check-string is every field except `hash`, sorted by
+// key, joined as "key=value" with newlines.
+function verifyTelegramLoginPayload(payload) {
+  if (!TELEGRAM_BOT_TOKEN) return { ok: false, reason: "TELEGRAM_BOT_TOKEN не настроен на сервере" };
+  const { hash, ...rest } = payload || {};
+  if (!hash) return { ok: false, reason: "no hash in payload" };
+  const dataCheckString = Object.keys(rest).filter((k) => rest[k] !== undefined && rest[k] !== null)
+    .sort().map((k) => `${k}=${rest[k]}`).join("\n");
+  const secretKey = crypto.createHash("sha256").update(TELEGRAM_BOT_TOKEN).digest();
+  const expected = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
+  const a = Buffer.from(hash, "hex");
+  const b = Buffer.from(expected, "hex");
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false, reason: "signature mismatch" };
+  const authDate = Number(rest.auth_date) * 1000;
+  if (!authDate || Date.now() - authDate > 24 * 60 * 60 * 1000) return { ok: false, reason: "auth_date too old (re-open the login page and try again)" };
+  return { ok: true };
+}
+let cachedBotUsername = null;
+async function getBotUsername() {
+  if (cachedBotUsername) return cachedBotUsername;
+  const me = await telegramCall("getMe");
+  cachedBotUsername = me.username;
+  return cachedBotUsername;
+}
+
 // ---- /match conversational flow (Telegram bot) ----
 // Mirrors the exact same participant-narrowing logic already used in the app's
 // match form: only players who are actually part of TODAY's event are offered,
@@ -222,8 +250,8 @@ const COOKIE_NAME = "padelcom_admin";
 function sign(payload) {
   return crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
 }
-function makeSessionToken() {
-  const body = Buffer.from(JSON.stringify({ exp: Date.now() + SESSION_TTL_MS })).toString("base64url");
+function makeSessionToken(payload) {
+  const body = Buffer.from(JSON.stringify({ ...(payload || {}), exp: Date.now() + SESSION_TTL_MS })).toString("base64url");
   return `${body}.${sign(body)}`;
 }
 function verifySessionToken(token) {
@@ -234,8 +262,10 @@ function verifySessionToken(token) {
   const b = Buffer.from(expected, "hex");
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
   try {
-    const { exp } = JSON.parse(Buffer.from(body, "base64url").toString());
-    return typeof exp === "number" && Date.now() < exp;
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString());
+    if (typeof payload.exp !== "number" || Date.now() >= payload.exp) return false;
+    return payload; // truthy object (not just `true`) — callers that only check for
+                     // truthiness (e.g. admin auth) keep working unchanged.
   } catch {
     return false;
   }
@@ -253,6 +283,11 @@ function parseCookies(req) {
 function isAdminRequest(req) {
   const cookies = parseCookies(req);
   return verifySessionToken(cookies[COOKIE_NAME]);
+}
+const PLAYER_COOKIE_NAME = "padelcom_player";
+function playerSessionFromRequest(req) {
+  const cookies = parseCookies(req);
+  return verifySessionToken(cookies[PLAYER_COOKIE_NAME]); // false, or { playerId, tgUserId, exp }
 }
 // ---- GitHub-backed storage ----
 // GITHUB_REPO must be "owner/repo" (a private repo dedicated to data, separate
@@ -824,6 +859,70 @@ async function processTelegramUpdate(update) {
 
       if (changed) await saveBlob(data);
 }
+
+  // ---- player identity: "Войти через Telegram" (Telegram Login Widget) ----
+  if (url === "/api/telegram/bot-username" && req.method === "GET") {
+    try {
+      const username = await getBotUsername();
+      send(res, 200, JSON.stringify({ username }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: String(e.message || e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url === "/api/player/login" && req.method === "POST") {
+    try {
+      const payload = await readJsonBody(req);
+      const check = verifyTelegramLoginPayload(payload);
+      if (!check.ok) { send(res, 401, JSON.stringify({ error: check.reason }), { "Content-Type": "application/json" }); return; }
+      const data = await loadBlob();
+      const tgUserId = String(payload.id);
+      const tgUsername = (payload.username || "").toLowerCase();
+      let player = (data.players || []).find((p) => p.telegramUserId && String(p.telegramUserId) === tgUserId);
+      if (!player && tgUsername) {
+        player = (data.players || []).find((p) => p.telegram && p.telegram.replace(/^@/, "").toLowerCase() === tgUsername);
+      }
+      if (!player) {
+        send(res, 404, JSON.stringify({ error: "no-match", detail: "Ваш Telegram не сопоставлен ни с одним игроком. Попросите администратора указать ваш @username в карточке игрока и попробуйте снова." }), { "Content-Type": "application/json" });
+        return;
+      }
+      player.telegramUserId = tgUserId;
+      player.telegramVerified = true;
+      if (tgUsername && !player.telegram) player.telegram = `@${payload.username}`;
+      await saveBlob(data);
+      const token = makeSessionToken({ playerId: player.id, tgUserId });
+      send(res, 200, JSON.stringify({ ok: true, playerId: player.id, playerName: [player.firstName, player.lastName].filter(Boolean).join(" ") }), {
+        "Content-Type": "application/json",
+        "Set-Cookie": `${PLAYER_COOKIE_NAME}=${token}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax`,
+      });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: String(e.message || e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url === "/api/player/session" && req.method === "GET") {
+    const session = playerSessionFromRequest(req);
+    if (!session) { send(res, 200, JSON.stringify({ loggedIn: false }), { "Content-Type": "application/json" }); return; }
+    try {
+      const data = await loadBlob();
+      const player = (data.players || []).find((p) => p.id === session.playerId);
+      if (!player) { send(res, 200, JSON.stringify({ loggedIn: false }), { "Content-Type": "application/json" }); return; }
+      send(res, 200, JSON.stringify({ loggedIn: true, playerId: player.id, playerName: [player.firstName, player.lastName].filter(Boolean).join(" ") }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 200, JSON.stringify({ loggedIn: false }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url === "/api/player/logout" && req.method === "POST") {
+    send(res, 200, JSON.stringify({ ok: true }), {
+      "Content-Type": "application/json",
+      "Set-Cookie": `${PLAYER_COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`,
+    });
+    return;
+  }
 
   if (url === "/api/telegram/webhook" && req.method === "POST") {
     console.log(`[telegram webhook] incoming request at ${new Date().toISOString()}`);
