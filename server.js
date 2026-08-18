@@ -1022,6 +1022,14 @@ async function processTelegramUpdate(update, data) {
   }
 
   if (url === "/api/data" && (req.method === "PUT" || req.method === "POST")) {
+    // Real enforcement point: only a verified player (or the admin, via its own
+    // /api/admin/* endpoints) may write. Hiding buttons in the UI is just
+    // convenience — this is what actually stops an unverified visitor from adding,
+    // editing, or deleting anything, even by calling the API directly.
+    if (!playerSessionFromRequest(req)) {
+      send(res, 403, JSON.stringify({ error: "not-verified", detail: "Только верифицированные через Telegram аккаунты могут вносить изменения. Войдите через Telegram (меню → «Войти через Telegram»)." }), { "Content-Type": "application/json" });
+      return;
+    }
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", async () => {
