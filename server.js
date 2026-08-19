@@ -555,6 +555,20 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/venues/", "places")) return;
+  if (url === "/api/admin/sessions" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const session = { id: crypto.randomUUID(), type: body.type || "", date: body.date || "", time: body.time || "", timeEnd: body.timeEnd || "", place: body.place || "", expenses: [], closed: false, messages: [], photos: [] };
+      data.sessions = [...(data.sessions || []), session];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, session }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/sessions/", "sessions")) return;
   if (url === "/api/admin/tournaments" && req.method === "POST") {
     if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
