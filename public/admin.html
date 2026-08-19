@@ -1,17 +1,30 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-bs-theme="dark">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>PadelCom — Админ</title>
-<meta name="robots" content="noindex, nofollow" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>PadelCom · Админ</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700&family=PT+Sans:wght@400;700&family=IBM+Plex+Mono:wght@400;500&display=swap" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/core@1.4.0/dist/css/tabler.min.css" />
 <style>
-  html, body { margin: 0; padding: 0; background: #F5F3ED; }
-  * { box-sizing: border-box; }
+  :root { --tblr-font-sans-serif: 'PT Sans', system-ui, sans-serif; }
+  body { font-family: 'PT Sans', system-ui, sans-serif; }
+  h1, h2, h3, h4, h5, h6, .navbar-brand { font-family: 'Montserrat', sans-serif; }
+  .font-mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+  /* PadelCom court-green accent, layered onto Tabler's dark palette */
+  :root, [data-bs-theme=dark] {
+    --tblr-primary: #2E9E6F;
+    --tblr-primary-rgb: 46, 158, 111;
+  }
+  .navbar-brand-script { font-family: 'Montserrat', sans-serif; font-weight: 700; }
+  .navbar-brand-script span { color: #2E9E6F; }
 </style>
 </head>
 <body>
 <div id="root"></div>
+<script src="https://cdn.jsdelivr.net/npm/@tabler/core@1.4.0/dist/js/tabler.min.js"></script>
 <script src="/admin-bundle.js"></script>
 </body>
 </html>
