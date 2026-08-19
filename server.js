@@ -502,6 +502,21 @@ const server = http.createServer(async (req, res) => {
 
   // ---- protected admin mutations: server verifies the session itself, the
   // client cannot bypass this by editing the page or crafting its own request ----
+  if (url === "/api/admin/players" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const player = { id: crypto.randomUUID(), firstName: body.firstName || "", lastName: body.lastName || "", gender: body.gender || "male" };
+      data.players = [...(data.players || []), player];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, player }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/players/", "players", (data, id) => {
     data.pairs = (data.pairs || []).filter((pr) => pr.primaryId !== id && pr.secondaryId !== id);
     (data.sessions || []).forEach((s) => {
@@ -671,6 +686,20 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- protected admin mutations: videos (WikiPadel) ----
+  if (url === "/api/admin/videos" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const video = { id: crypto.randomUUID(), url: body.url || "", title: body.title || "", cover: body.cover || "" };
+      data.videos = [...(data.videos || []), video];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, video }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
   if (await handleAdminEntityRoute(req, res, url, "/api/admin/videos/", "videos")) return;
 
   // ---- protected admin mutations: simple reference lists (типы объектов/событий и т.п.) ----
