@@ -699,6 +699,41 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ---- protected admin mutations: WikiPadel "Правила" (special article id "seed-rules") ----
+  if (url === "/api/admin/rules" && req.method === "PUT") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      const list = data.articles || [];
+      const idx = list.findIndex((a) => a.id === "seed-rules");
+      const article = { id: "seed-rules", title: body.title || "Правила падела", body: body.body || "", cover: body.cover || "" };
+      if (idx >= 0) list[idx] = { ...list[idx], ...article }; else list.unshift(article);
+      data.articles = list;
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, article }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  // ---- protected admin mutations: WikiPadel NTRP scale (editable override of the
+  // hardcoded default; the app falls back to its built-in scale until this is set) ----
+  if (url === "/api/admin/ntrp-scale" && req.method === "PUT") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const data = await loadBlob();
+      data.ntrpScale = Array.isArray(body.ntrpScale) ? body.ntrpScale : [];
+      await saveBlob(data);
+      send(res, 200, JSON.stringify({ ok: true, ntrpScale: data.ntrpScale }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
   // ---- protected admin mutations: videos (WikiPadel) ----
   if (url === "/api/admin/videos" && req.method === "POST") {
     if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
@@ -1117,6 +1152,11 @@ async function processTelegramUpdate(update, data) {
             }
             return p;
           });
+          // ntrpScale is admin-only (edited from the admin panel, never sent by the
+          // regular app client since it doesn't include this field in its save
+          // payload at all) — always keep whatever the server currently has, or the
+          // very next autosave from any open app tab would silently erase it.
+          incoming.ntrpScale = current.ntrpScale || [];
           result = incoming;
           return incoming;
         });
