@@ -779,6 +779,7 @@ const server = http.createServer(async (req, res) => {
       const patch = await readJsonBody(req);
       const data = await loadBlob();
       if (patch.currency) data.currency = patch.currency;
+      if (patch.language) data.language = patch.language;
       await saveBlob(data);
       send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
     } catch (e) {
@@ -1157,6 +1158,19 @@ async function processTelegramUpdate(update, data) {
           // payload at all) — always keep whatever the server currently has, or the
           // very next autosave from any open app tab would silently erase it.
           incoming.ntrpScale = current.ntrpScale || [];
+          incoming.language = current.language || "ru";
+          // Same staleness risk for matches recorded via the Telegram /матч bot flow:
+          // finishMatchFlow() pushes directly into storage out-of-band from any open
+          // app tab. A stale client save (loaded before the bot's match was added)
+          // would otherwise silently erase it when its own, incomplete matchRecords
+          // array overwrites the whole blob. Merge back in any current match missing
+          // from the incoming payload — deletion of a match record only ever happens
+          // through the dedicated /api/admin/match-records/:id DELETE endpoint, never
+          // through this general save, so nothing legitimate is lost by preserving
+          // them here.
+          const incomingMatchIds = new Set((incoming.matchRecords || []).map((m) => m.id));
+          const missingMatches = (current.matchRecords || []).filter((m) => !incomingMatchIds.has(m.id));
+          incoming.matchRecords = [...(incoming.matchRecords || []), ...missingMatches];
           result = incoming;
           return incoming;
         });
