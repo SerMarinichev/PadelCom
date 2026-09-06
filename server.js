@@ -88,7 +88,15 @@ function sessionParticipantIdsServer(s, pairs) {
   return [...set];
 }
 function playerName(p) { return [p.firstName, p.lastName].filter(Boolean).join(" ").trim() || "Без имени"; }
-function todayISOServer() { return new Date().toISOString().slice(0, 10); }
+// Render's server clock is UTC, but events are dated by Tashkent-local convention
+// (Asia/Tashkent, UTC+5). Between 00:00–04:59 Tashkent time, raw UTC would still
+// report the previous calendar day — exactly the hours right after a late evening
+// padel session, when someone is most likely to send /матч. Using the club's own
+// timezone here keeps "today" consistent with whatever date the event was created
+// with in the app.
+function todayISOServer() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Tashkent" });
+}
 
 const MATCH_FLOW_STEPS = ["type", "p1a", "p1b", "p2a", "p2b", "score"];
 // In-memory (not persisted to GitHub) — deliberately so: this only needs to survive
