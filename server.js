@@ -231,6 +231,17 @@ async function advanceMatchFlow(chatId, action) {
   }
 }
 
+// Confirmations for the /матч flow's final step are staged here rather than sent
+// immediately inside finishMatchFlow — that function runs as the updateBlob
+// *mutator*, which executes strictly BEFORE the actual GitHub save. Sending
+// "Записал ✓" from inside it would tell the user their match was recorded even
+// if the save that follows then fails (network blip, GitHub rate limit, sha
+// conflict exhausting retries, etc.) — exactly the failure mode where the bot
+// confirms success but the match never actually reaches storage. The webhook
+// handler below only flushes this queue after `await task` (the full
+// updateBlob call, save included) has resolved without throwing.
+const telegramPendingConfirmations = new Map(); // chatId -> message text
+
 async function finishMatchFlow(data, chatId, text) {
   const flow = telegramFlows.get(flowKey(chatId));
   if (!flow || flow.step !== "score") return false;
@@ -249,7 +260,7 @@ async function finishMatchFlow(data, chatId, text) {
     participant1: flow.p1, participant2: flow.p2, score1: parseInt(m[1], 10), score2: parseInt(m[2], 10),
   });
   telegramFlows.delete(flowKey(chatId));
-  await telegramCall("sendMessage", { chat_id: chatId, text: `Записал ✓\n${flow.p1.map(nameOf).join(" / ")} ${m[1]} : ${m[2]} ${flow.p2.map(nameOf).join(" / ")}` }).catch(() => {});
+  telegramPendingConfirmations.set(chatId, `Записал ✓\n${flow.p1.map(nameOf).join(" / ")} ${m[1]} : ${m[2]} ${flow.p2.map(nameOf).join(" / ")}`);
   return true;
 }
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
@@ -1086,7 +1097,26 @@ async function processTelegramUpdate(update, data) {
 
       const task = telegramWebhookQueue.then(() => updateBlob((data) => processTelegramUpdate(update, data)));
       telegramWebhookQueue = task.catch(() => {}); // keep the chain alive even if this update errors
-      await task;
+      try {
+        await task;
+        // Only now that the save has actually landed do we tell the user their
+        // match was recorded — see telegramPendingConfirmations for why this
+        // can't happen any earlier.
+        for (const [chatId, text] of telegramPendingConfirmations) {
+          await telegramCall("sendMessage", { chat_id: chatId, text }).catch(() => {});
+        }
+      } catch (saveErr) {
+        console.error("[telegram webhook] save failed after processing update:", saveErr);
+        // The match was computed but never actually reached storage — tell the
+        // affected chat plainly rather than leaving them thinking it worked
+        // (they already saw no confirmation) or silently losing the result.
+        for (const chatId of telegramPendingConfirmations.keys()) {
+          await telegramCall("sendMessage", { chat_id: chatId, text: "Не удалось сохранить матч (проблема с хранилищем) — пришлите счёт ещё раз через минуту." }).catch(() => {});
+        }
+        throw saveErr;
+      } finally {
+        telegramPendingConfirmations.clear();
+      }
       send(res, 200, "OK", { "Content-Type": "text/plain" });
     } catch (e) {
       console.error("telegram webhook error:", e);
