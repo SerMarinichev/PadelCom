@@ -1138,6 +1138,78 @@ async function processTelegramUpdate(update, data) {
     return;
   }
 
+  // ---- Mexicano tournaments ----
+  // Kept on their own endpoints rather than riding the whole-blob /api/data save:
+  // a tournament is edited round-by-round, live on court, while other people may
+  // have the app open. Each write here is a targeted read-modify-write through the
+  // same serialized queue, so one organiser entering scores can't be clobbered by
+  // someone else's unrelated autosave.
+  if (url === "/api/mexicano" && req.method === "POST") {
+    if (!playerSessionFromRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      let created = null;
+      await updateBlob((data) => {
+        created = {
+          id: crypto.randomUUID().slice(0, 8),
+          name: body.name || "Mexicano",
+          date: body.date || todayISOServer(),
+          pointsPerMatch: Number(body.pointsPerMatch) || 24,
+          courts: Number(body.courts) || 1,
+          seeding: body.seeding === "1+3" ? "1+3" : "1+4",
+          playerIds: Array.isArray(body.playerIds) ? body.playerIds : [],
+          rounds: [],
+          finished: false,
+          createdAt: new Date().toISOString(),
+        };
+        data.mexicanoTournaments = [...(data.mexicanoTournaments || []), created];
+        return data;
+      });
+      send(res, 200, JSON.stringify({ ok: true, tournament: created }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url.startsWith("/api/mexicano/") && req.method === "PUT") {
+    if (!playerSessionFromRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    const id = decodeURIComponent(url.slice("/api/mexicano/".length));
+    try {
+      const body = await readJsonBody(req);
+      let found = false;
+      await updateBlob((data) => {
+        data.mexicanoTournaments = (data.mexicanoTournaments || []).map((t) => {
+          if (t.id !== id) return t;
+          found = true;
+          // id/createdAt are server-owned and never taken from the client.
+          return { ...t, ...body, id: t.id, createdAt: t.createdAt };
+        });
+        return data;
+      });
+      if (!found) { send(res, 404, JSON.stringify({ error: "not found" }), { "Content-Type": "application/json" }); return; }
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url.startsWith("/api/mexicano/") && req.method === "DELETE") {
+    if (!playerSessionFromRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    const id = decodeURIComponent(url.slice("/api/mexicano/".length));
+    try {
+      await updateBlob((data) => {
+        data.mexicanoTournaments = (data.mexicanoTournaments || []).filter((t) => t.id !== id);
+        return data;
+      });
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
   if (url === "/api/data" && (req.method === "PUT" || req.method === "POST")) {
     // Real enforcement point: only a verified player (or the admin, via its own
     // /api/admin/* endpoints) may write. Hiding buttons in the UI is just
@@ -1206,6 +1278,14 @@ async function processTelegramUpdate(update, data) {
           // through the dedicated /api/admin/match-records/:id DELETE endpoint, never
           // through this general save, so nothing legitimate is lost by preserving
           // them here.
+          // Mexicano tournaments are written exclusively through /api/mexicano/*
+          // by whoever is running the tournament on court — out-of-band from any
+          // other open app tab. Same staleness risk as matchRecords: a tab that
+          // loaded before the tournament started would otherwise wipe it on its
+          // next autosave. Server state always wins here; deletion goes through
+          // the dedicated DELETE endpoint, never through this general save.
+          incoming.mexicanoTournaments = current.mexicanoTournaments || [];
+
           const incomingMatchIds = new Set((incoming.matchRecords || []).map((m) => m.id));
           const missingMatches = (current.matchRecords || []).filter((m) => !incomingMatchIds.has(m.id));
           incoming.matchRecords = [...(incoming.matchRecords || []), ...missingMatches];
@@ -1221,7 +1301,7 @@ async function processTelegramUpdate(update, data) {
   }
 
   // ---- static files ----
-  let filePath = path.join(PUBLIC_DIR, url === "/" ? "index.html" : (url === "/admin" ? "admin.html" : url));
+  let filePath = path.join(PUBLIC_DIR, url === "/" ? "index.html" : (url === "/admin" ? "admin.html" : (url === "/mexicano" ? "mexicano.html" : url)));
   if (!filePath.startsWith(PUBLIC_DIR)) {
     return send(res, 403, "Forbidden");
   }
