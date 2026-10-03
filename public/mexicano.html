@@ -11,7 +11,12 @@
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; font-family: 'PT Sans', system-ui, sans-serif; background: #F5F3ED; }
-  input, select, button { font-family: inherit; }
+  input, select, button, textarea { font-family: inherit; }
+  /* Safety net for the iOS focus-zoom problem: anything under 16px makes Safari
+     zoom the viewport on focus, and in standalone (home-screen) mode it often
+     doesn't zoom back out. Inline styles already set 16px; this catches any
+     field that doesn't go through them. */
+  input, select, textarea { font-size: 16px; }
   input[type=number]::-webkit-outer-spin-button,
   input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
   input[type=number] { -moz-appearance: textfield; }
