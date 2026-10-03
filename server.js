@@ -1145,7 +1145,7 @@ async function processTelegramUpdate(update, data) {
   // same serialized queue, so one organiser entering scores can't be clobbered by
   // someone else's unrelated autosave.
   if (url === "/api/mexicano" && req.method === "POST") {
-    if (!playerSessionFromRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    if (!playerSessionFromRequest(req) && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
     try {
       const body = await readJsonBody(req);
       let created = null;
@@ -1173,7 +1173,7 @@ async function processTelegramUpdate(update, data) {
   }
 
   if (url.startsWith("/api/mexicano/") && req.method === "PUT") {
-    if (!playerSessionFromRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    if (!playerSessionFromRequest(req) && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
     const id = decodeURIComponent(url.slice("/api/mexicano/".length));
     try {
       const body = await readJsonBody(req);
@@ -1196,7 +1196,7 @@ async function processTelegramUpdate(update, data) {
   }
 
   if (url.startsWith("/api/mexicano/") && req.method === "DELETE") {
-    if (!playerSessionFromRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    if (!playerSessionFromRequest(req) && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
     const id = decodeURIComponent(url.slice("/api/mexicano/".length));
     try {
       await updateBlob((data) => {
