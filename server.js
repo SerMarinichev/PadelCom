@@ -1156,8 +1156,11 @@ async function processTelegramUpdate(update, data) {
           date: body.date || todayISOServer(),
           pointsPerMatch: Number(body.pointsPerMatch) || 24,
           courts: Number(body.courts) || 1,
+          format: body.format === "americano" ? "americano" : "mexicano",
           seeding: body.seeding === "1+3" ? "1+3" : "1+4",
+          targetRounds: Number(body.targetRounds) > 0 ? Number(body.targetRounds) : null,
           playerIds: Array.isArray(body.playerIds) ? body.playerIds : [],
+          withdrawals: [],
           rounds: [],
           finished: false,
           createdAt: new Date().toISOString(),
@@ -1301,7 +1304,7 @@ async function processTelegramUpdate(update, data) {
   }
 
   // ---- static files ----
-  let filePath = path.join(PUBLIC_DIR, url === "/" ? "index.html" : (url === "/admin" ? "admin.html" : (url === "/mexicano" ? "mexicano.html" : url)));
+  let filePath = path.join(PUBLIC_DIR, url === "/" ? "index.html" : (url === "/admin" ? "admin.html" : (url === "/mexicano" ? "mexicano.html" : (url === "/rating" ? "rating.html" : url))));
   if (!filePath.startsWith(PUBLIC_DIR)) {
     return send(res, 403, "Forbidden");
   }
