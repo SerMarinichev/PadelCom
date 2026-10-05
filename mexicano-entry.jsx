@@ -1,26 +1,23 @@
 import React, { useState, useEffect } from "react";
 import { createRoot } from "react-dom/client";
+import {
+  FORMATS, buildRound, computeStandings, sortedStandings, buildHistory,
+  activePlayerIds, recommendedRounds, restIsEven, playingCount,
+} from "./engine.js";
 
 // ---------- design tokens (kept in sync with the main app) ----------
 const C = {
-  paper: "#F5F3ED",
-  paperDim: "#EFEDE4",
-  card: "#FFFFFF",
-  ink: "#1A1B1D",
-  slate: "#4A4D52",
-  slateFaint: "#8A8D93",
-  rule: "#DFDBCF",
-  court: "#2E9E6F",
-  action: "#2F6DB3",
-  rust: "#B5603A",
-  positive: "#2E9E6F",
-  negative: "#C0493B",
+  paper: "#F5F3ED", paperDim: "#EFEDE4", card: "#FFFFFF", ink: "#1A1B1D",
+  slate: "#4A4D52", slateFaint: "#8A8D93", rule: "#DFDBCF",
+  court: "#2E9E6F", action: "#2F6DB3", rust: "#B5603A",
+  positive: "#2E9E6F", negative: "#C0493B",
 };
 const FONT_DISPLAY = "'Montserrat', sans-serif";
 const FONT_BODY = "'PT Sans', system-ui, sans-serif";
 const FONT_MONO = "'IBM Plex Mono', ui-monospace, monospace";
 
 const fullName = (p) => [p.firstName, p.lastName].filter(Boolean).join(" ").trim() || "Без имени";
+const FORMAT_LABEL = { [FORMATS.MEXICANO]: "Mexicano", [FORMATS.AMERICANO]: "Americano" };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -38,221 +35,142 @@ async function api(path, opts = {}) {
   return json;
 }
 
-// ============================================================================
-// Mexicano rotation engine
-// ============================================================================
-// Round 1 is a random draw. Every round after is built from the live standings:
-// players are ranked by current personal points, then grouped four at a time —
-// ranks 1-4 go to court 1, ranks 5-8 to court 2, and so on. Within each group of
-// four the default pairing is 1+4 vs 2+3, which produces the most even match;
-// 1+3 vs 2+2 is the other variant organisers use, so it's a setting rather than
-// hardcoded. Scoring is personal: whatever your pair scores in a round is added
-// to your own total, so your partner changes but the points stay yours.
-
-// How many players can actually be on court this round.
-function playingCount(totalPlayers, courts) {
-  return Math.min(Math.floor(totalPlayers / 4) * 4, courts * 4);
-}
-
-// Who sits this round. Players who have sat out most so far get priority to play,
-// so across a tournament the breaks spread evenly instead of landing on the same
-// people. Only matters when the squad isn't a clean multiple of four, or when
-// there are more players than courts.
-function selectPlaying(players, standings, courts) {
-  const n = playingCount(players.length, courts);
-  if (n === players.length) return { playing: [...players], sitting: [] };
-  const ordered = [...players].sort((a, b) => {
-    const sa = standings[a.id]?.sitOuts || 0;
-    const sb = standings[b.id]?.sitOuts || 0;
-    if (sa !== sb) return sb - sa;                       // sat out more -> plays first
-    return (standings[b.id]?.points || 0) - (standings[a.id]?.points || 0);
-  });
-  return { playing: ordered.slice(0, n), sitting: ordered.slice(n) };
-}
-
-function buildRound(players, standings, courts, seeding, roundIndex) {
-  const { playing, sitting } = selectPlaying(players, standings, courts);
-
-  let ranked;
-  if (roundIndex === 0) {
-    // Opening draw is random — nobody has a record yet to seed from.
-    ranked = [...playing].sort(() => Math.random() - 0.5);
-  } else {
-    ranked = [...playing].sort((a, b) => {
-      const pa = standings[a.id]?.points || 0;
-      const pb = standings[b.id]?.points || 0;
-      if (pa !== pb) return pb - pa;
-      return fullName(a).localeCompare(fullName(b)); // stable, predictable tiebreak
-    });
-  }
-
-  const matches = [];
-  for (let i = 0; i + 3 < ranked.length; i += 4) {
-    const [r1, r2, r3, r4] = ranked.slice(i, i + 4);
-    const pairing = seeding === "1+3"
-      ? { team1: [r1, r3], team2: [r2, r4] }
-      : { team1: [r1, r4], team2: [r2, r3] };
-    matches.push({
-      court: matches.length + 1,
-      team1: pairing.team1.map((p) => p.id),
-      team2: pairing.team2.map((p) => p.id),
-      score1: null,
-      score2: null,
-    });
-  }
-  return { matches, sitting: sitting.map((p) => p.id) };
-}
-
-// Personal totals rebuilt from scratch off the recorded rounds, so standings can
-// never drift out of sync with the scores actually entered.
-function computeStandings(tournament, playersById) {
-  const standings = {};
-  (tournament.playerIds || []).forEach((id) => {
-    standings[id] = { id, points: 0, conceded: 0, played: 0, sitOuts: 0, wins: 0 };
-  });
-  (tournament.rounds || []).forEach((round) => {
-    (round.sitting || []).forEach((id) => { if (standings[id]) standings[id].sitOuts++; });
-    (round.matches || []).forEach((m) => {
-      if (m.score1 === null || m.score2 === null) return;
-      const s1 = Number(m.score1) || 0;
-      const s2 = Number(m.score2) || 0;
-      m.team1.forEach((id) => {
-        if (!standings[id]) return;
-        standings[id].points += s1;
-        standings[id].conceded += s2;
-        standings[id].played++;
-        if (s1 > s2) standings[id].wins++;
-      });
-      m.team2.forEach((id) => {
-        if (!standings[id]) return;
-        standings[id].points += s2;
-        standings[id].conceded += s1;
-        standings[id].played++;
-        if (s2 > s1) standings[id].wins++;
-      });
-    });
-  });
-  return standings;
-}
-
-function sortedStandings(standings, playersById) {
-  return Object.values(standings).sort((a, b) => {
-    if (b.points !== a.points) return b.points - a.points;
-    const da = a.points - a.conceded;
-    const db = b.points - b.conceded;
-    if (db !== da) return db - da;                        // point difference
-    if (b.wins !== a.wins) return b.wins - a.wins;
-    const pa = playersById[a.id], pb = playersById[b.id];
-    return fullName(pa || {}).localeCompare(fullName(pb || {}));
-  });
-}
-
-// ============================================================================
-// UI
-// ============================================================================
-const btn = (bg, color = "#fff") => ({
-  fontSize: 13, fontWeight: 600, color, background: bg, border: "none",
-  borderRadius: 8, padding: "9px 16px", cursor: "pointer",
-});
-// 16px is deliberate, not a style choice: iOS Safari zooms the whole viewport
-// when a focused input's font-size is under 16px, and when the app runs
-// standalone (added to home screen) it often fails to zoom back out afterwards,
-// leaving the layout shifted until the user pinches it back manually. Keeping
-// every field at 16px prevents the zoom from ever triggering. The alternative —
-// maximum-scale=1 in the viewport meta — also stops it, but at the cost of
-// disabling pinch-zoom entirely, which is an accessibility regression.
+// 16px on every field is deliberate: below that iOS Safari zooms the viewport
+// on focus and, in standalone mode, frequently fails to zoom back out.
 const inputStyle = {
   fontSize: 16, border: `1px solid ${C.rule}`, borderRadius: 7,
   padding: "8px 10px", background: C.paper, fontFamily: FONT_BODY, color: C.ink,
 };
+const btn = (bg, color = "#fff") => ({
+  fontSize: 14, fontWeight: 600, color, background: bg, border: "none",
+  borderRadius: 8, padding: "9px 16px", cursor: "pointer",
+});
 
-function Avatar({ player, size = 26 }) {
+function Avatar({ player, size = 26, dim }) {
   if (!player) return null;
   const initials = `${(player.firstName || "?")[0] || ""}${(player.lastName || "")[0] || ""}`;
-  if (player.photo) {
-    return <span style={{ width: size, height: size, flex: "0 0 auto", borderRadius: "50%", backgroundImage: `url(${player.photo})`, backgroundSize: "cover", backgroundPosition: "center", display: "inline-block" }} />;
-  }
-  return (
-    <span style={{ width: size, height: size, flex: "0 0 auto", borderRadius: "50%", background: player.gender === "female" ? "#F3DDD5" : "#D8E3F0", color: C.ink, fontSize: size * 0.38, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>{initials}</span>
-  );
+  const base = { width: size, height: size, flex: "0 0 auto", borderRadius: "50%", display: "inline-flex", alignItems: "center", justifyContent: "center", opacity: dim ? 0.45 : 1 };
+  if (player.photo) return <span style={{ ...base, backgroundImage: `url(${player.photo})`, backgroundSize: "cover", backgroundPosition: "center" }} />;
+  return <span style={{ ...base, background: player.gender === "female" ? "#F3DDD5" : "#D8E3F0", color: C.ink, fontSize: size * 0.38, fontWeight: 700 }}>{initials}</span>;
 }
 
+// ============================================================================
+// Create form
+// ============================================================================
 function CreateForm({ players, onCreate, onCancel, busy }) {
-  const [name, setName] = useState("Mexicano");
+  const [format, setFormat] = useState(FORMATS.MEXICANO);
+  const [name, setName] = useState("");
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
   const [pointsPerMatch, setPointsPerMatch] = useState(24);
   const [courts, setCourts] = useState(1);
   const [seeding, setSeeding] = useState("1+4");
   const [selected, setSelected] = useState([]);
+  const [targetRounds, setTargetRounds] = useState("");
+  const [touchedRounds, setTouchedRounds] = useState(false);
 
   const toggle = (id) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
   const enough = selected.length >= 4;
   const willPlay = playingCount(selected.length, courts);
   const willSit = selected.length - willPlay;
+  const rec = enough ? recommendedRounds(format, selected.length, courts) : null;
+
+  // Keep the round box on the recommendation until the organiser overrides it.
+  useEffect(() => {
+    if (!touchedRounds && rec) setTargetRounds(String(rec.rounds));
+  }, [rec && rec.rounds, touchedRounds]);
+
+  const roundsNum = Number(targetRounds) || 0;
+  const evenRest = enough && roundsNum > 0 ? restIsEven(selected.length, courts, roundsNum) : true;
 
   return (
     <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
-      <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 16, marginBottom: 14 }}>Новый турнир Mexicano</div>
+      <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 16, marginBottom: 14 }}>Новый турнир</div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+        {[FORMATS.MEXICANO, FORMATS.AMERICANO].map((f) => (
+          <button key={f} onClick={() => { setFormat(f); setTouchedRounds(false); }} style={{
+            flex: 1, fontSize: 14, fontWeight: 600, padding: "10px 8px", cursor: "pointer", borderRadius: 8,
+            background: format === f ? C.court : C.paper, color: format === f ? "#fff" : C.ink,
+            border: `1px solid ${format === f ? C.court : C.rule}`,
+          }}>{FORMAT_LABEL[f]}</button>
+        ))}
+      </div>
+      <div style={{ fontSize: 12, color: C.slateFaint, marginBottom: 14, lineHeight: 1.45 }}>
+        {format === FORMATS.MEXICANO
+          ? "Соперников подбирает таблица: чем лучше идёт игра, тем сильнее соперники."
+          : "Фиксированная ротация: каждый сыграет в паре с каждым, счёт на состав не влияет."}
+      </div>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
         <div style={{ flex: "1 1 160px" }}>
           <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Название</div>
-          <input value={name} onChange={(e) => setName(e.target.value)} style={{ ...inputStyle, width: "100%" }} />
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder={FORMAT_LABEL[format]} style={{ ...inputStyle, width: "100%" }} />
         </div>
-        <div style={{ flex: "0 0 150px" }}>
+        <div style={{ flex: "0 0 155px" }}>
           <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Дата</div>
           <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={{ ...inputStyle, width: "100%" }} />
         </div>
       </div>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
-        <div style={{ flex: "0 0 140px" }}>
+        <div style={{ flex: "0 0 145px" }}>
           <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Матч до скольки очков</div>
           <select value={pointsPerMatch} onChange={(e) => setPointsPerMatch(Number(e.target.value))} style={{ ...inputStyle, width: "100%" }}>
-            {/* Multiples of 4 only: service rotates every 2 or 4 points, so a target
-                divisible by 4 gives all four players an equal number of serves —
-                and keeps a draw (12:12 at 24) a reachable, legitimate result. */}
             {[12, 16, 20, 24, 28, 32].map((v) => <option key={v} value={v}>{v}</option>)}
           </select>
         </div>
         <div style={{ flex: "0 0 110px" }}>
           <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Кортов</div>
-          <select value={courts} onChange={(e) => setCourts(Number(e.target.value))} style={{ ...inputStyle, width: "100%" }}>
+          <select value={courts} onChange={(e) => { setCourts(Number(e.target.value)); setTouchedRounds(false); }} style={{ ...inputStyle, width: "100%" }}>
             {[1, 2, 3, 4, 5, 6].map((v) => <option key={v} value={v}>{v}</option>)}
           </select>
         </div>
-        <div style={{ flex: "0 0 170px" }}>
-          <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Схема пар</div>
-          <select value={seeding} onChange={(e) => setSeeding(e.target.value)} style={{ ...inputStyle, width: "100%" }}>
-            <option value="1+4">1+4 против 2+3</option>
-            <option value="1+3">1+3 против 2+4</option>
-          </select>
+        {format === FORMATS.MEXICANO && (
+          <div style={{ flex: "0 0 175px" }}>
+            <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Схема пар</div>
+            <select value={seeding} onChange={(e) => setSeeding(e.target.value)} style={{ ...inputStyle, width: "100%" }}>
+              <option value="1+4">1+4 против 2+3</option>
+              <option value="1+3">1+3 против 2+4</option>
+            </select>
+          </div>
+        )}
+        <div style={{ flex: "0 0 130px" }}>
+          <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Раундов</div>
+          <input type="number" min="1" max="40" value={targetRounds}
+            onChange={(e) => { setTouchedRounds(true); setTargetRounds(e.target.value); }}
+            style={{ ...inputStyle, width: "100%" }} />
         </div>
       </div>
+
+      {rec && (
+        <div style={{ fontSize: 12, color: evenRest ? C.slate : C.rust, background: evenRest ? C.paperDim : `${C.rust}12`, border: `1px solid ${evenRest ? C.rule : C.rust}`, borderRadius: 8, padding: "8px 11px", marginBottom: 12, lineHeight: 1.45 }}>
+          Рекомендуется <b>{rec.rounds}</b> — {rec.reason}.
+          {!evenRest && roundsNum > 0 && <> При {roundsNum} раундах отдых распределится неравномерно.</>}
+        </div>
+      )}
 
       <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 6 }}>
         Участники — выбрано {selected.length}
         {selected.length > 0 && !enough && <span style={{ color: C.rust }}> · нужно минимум 4</span>}
         {enough && <span> · играют {willPlay}{willSit > 0 ? `, отдыхают ${willSit}` : ""}</span>}
       </div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14, maxHeight: 220, overflowY: "auto" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14, maxHeight: 230, overflowY: "auto" }}>
         {players.map((p) => {
           const on = selected.includes(p.id);
           return (
             <button key={p.id} onClick={() => toggle(p.id)} style={{
-              display: "flex", alignItems: "center", gap: 6, fontSize: 12.5,
+              display: "flex", alignItems: "center", gap: 6, fontSize: 13,
               background: on ? C.court : C.paper, color: on ? "#fff" : C.ink,
               border: `1px solid ${on ? C.court : C.rule}`, borderRadius: 999,
               padding: "5px 11px", cursor: "pointer",
-            }}>
-              <Avatar player={p} size={20} /> {fullName(p)}
-            </button>
+            }}><Avatar player={p} size={20} /> {fullName(p)}</button>
           );
         })}
       </div>
 
       <div style={{ display: "flex", gap: 8 }}>
-        <button disabled={!enough || busy} onClick={() => onCreate({ name, date, pointsPerMatch, courts, seeding, playerIds: selected })}
+        <button disabled={!enough || busy}
+          onClick={() => onCreate({ format, name: name.trim() || FORMAT_LABEL[format], date, pointsPerMatch, courts, seeding, playerIds: selected, targetRounds: roundsNum || null })}
           style={{ ...btn(C.court), opacity: !enough || busy ? 0.45 : 1 }}>Создать турнир</button>
         <button onClick={onCancel} style={{ ...btn("none", C.slateFaint), border: `1px solid ${C.rule}` }}>Отмена</button>
       </div>
@@ -260,31 +178,44 @@ function CreateForm({ players, onCreate, onCancel, busy }) {
   );
 }
 
-function StandingsTable({ standings, playersById }) {
-  const rows = sortedStandings(standings, playersById);
+// ============================================================================
+// Standings
+// ============================================================================
+function StandingsTable({ tournament, standings, playersById }) {
+  const nameOf = (id) => (playersById[id] ? fullName(playersById[id]) : "—");
+  const rows = sortedStandings(standings, nameOf);
+  const withdrawnIds = new Set((tournament.withdrawals || []).map((w) => w.playerId));
+  const reasonOf = (id) => (tournament.withdrawals || []).find((w) => w.playerId === id)?.reason;
+
   return (
     <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, overflow: "hidden" }}>
       <div style={{ display: "flex", padding: "9px 14px", background: C.paperDim, fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-        <span style={{ width: 26 }}>#</span>
+        <span style={{ width: 24 }}>#</span>
         <span style={{ flex: 1 }}>Игрок</span>
-        <span style={{ width: 52, textAlign: "right" }}>Очки</span>
-        <span style={{ width: 46, textAlign: "right" }}>Разн.</span>
-        <span style={{ width: 40, textAlign: "right" }}>Игр</span>
+        <span style={{ width: 50, textAlign: "right" }}>Очки</span>
+        <span style={{ width: 44, textAlign: "right" }}>Разн.</span>
+        <span style={{ width: 34, textAlign: "right" }}>Игр</span>
+        <span style={{ width: 62, textAlign: "right" }}>Пропуск</span>
       </div>
       {rows.map((r, i) => {
         const p = playersById[r.id];
+        const out = withdrawnIds.has(r.id);
         return (
-          <div key={r.id} style={{ display: "flex", alignItems: "center", padding: "9px 14px", borderTop: `1px solid ${C.rule}`, background: i === 0 ? "#F6FBF8" : C.card }}>
-            <span style={{ width: 26, fontFamily: FONT_MONO, fontSize: 12.5, color: i === 0 ? C.court : C.slateFaint, fontWeight: i === 0 ? 700 : 400 }}>{i + 1}</span>
+          <div key={r.id} style={{ display: "flex", alignItems: "center", padding: "9px 14px", borderTop: `1px solid ${C.rule}`, background: i === 0 && !out ? "#F6FBF8" : C.card, opacity: out ? 0.55 : 1 }}>
+            <span style={{ width: 24, fontFamily: FONT_MONO, fontSize: 12.5, color: i === 0 && !out ? C.court : C.slateFaint, fontWeight: i === 0 && !out ? 700 : 400 }}>{i + 1}</span>
             <span style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, fontSize: 13.5, minWidth: 0 }}>
-              <Avatar player={p} size={24} />
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p ? fullName(p) : "—"}</span>
+              <Avatar player={p} size={24} dim={out} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: out ? "line-through" : "none" }}>
+                {p ? fullName(p) : "—"}
+              </span>
+              {out && <span title={reasonOf(r.id) || "выбыл"} style={{ fontSize: 10, color: C.rust, border: `1px solid ${C.rust}`, borderRadius: 999, padding: "0 6px", flex: "0 0 auto" }}>выбыл</span>}
             </span>
-            <span style={{ width: 52, textAlign: "right", fontFamily: FONT_MONO, fontWeight: 700, fontSize: 14 }}>{r.points}</span>
-            <span style={{ width: 46, textAlign: "right", fontFamily: FONT_MONO, fontSize: 12, color: r.points - r.conceded >= 0 ? C.positive : C.negative }}>
+            <span style={{ width: 50, textAlign: "right", fontFamily: FONT_MONO, fontWeight: 700, fontSize: 14 }}>{r.points}</span>
+            <span style={{ width: 44, textAlign: "right", fontFamily: FONT_MONO, fontSize: 12, color: r.points - r.conceded >= 0 ? C.positive : C.negative }}>
               {r.points - r.conceded >= 0 ? "+" : ""}{r.points - r.conceded}
             </span>
-            <span style={{ width: 40, textAlign: "right", fontFamily: FONT_MONO, fontSize: 12, color: C.slateFaint }}>{r.played}</span>
+            <span style={{ width: 34, textAlign: "right", fontFamily: FONT_MONO, fontSize: 12, color: C.slateFaint }}>{r.played}</span>
+            <span style={{ width: 62, textAlign: "right", fontFamily: FONT_MONO, fontSize: 12, color: r.sitOuts > 0 ? C.rust : C.slateFaint }}>{r.sitOuts}</span>
           </div>
         );
       })}
@@ -292,34 +223,53 @@ function StandingsTable({ standings, playersById }) {
   );
 }
 
-function RoundCard({ round, roundIndex, playersById, pointsPerMatch, onScore, editable }) {
+// ============================================================================
+// One round
+// ============================================================================
+function RoundCard({ round, roundIndex, playersById, pointsPerMatch, onScore, canEnter, canEditSaved }) {
   const nameOf = (id) => (playersById[id] ? fullName(playersById[id]) : "—");
   return (
     <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 14, marginBottom: 12 }}>
       <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Раунд {roundIndex + 1}</div>
       {round.matches.map((m, mi) => {
-        const done = m.score1 !== null && m.score2 !== null;
+        const saved = m.score1 !== null && m.score1 !== undefined && m.score2 !== null && m.score2 !== undefined;
+        // Entering a result the first time is part of running the tournament.
+        // Changing one that's already recorded is a correction, and corrections
+        // are an admin action — otherwise anyone could quietly rewrite history.
+        const editable = saved ? canEditSaved : canEnter;
         return (
           <div key={mi} style={{ borderTop: mi === 0 ? "none" : `1px solid ${C.rule}`, paddingTop: mi === 0 ? 0 : 10, marginTop: mi === 0 ? 0 : 10 }}>
             <div style={{ fontSize: 10.5, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Корт {m.court}</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-              <span style={{ flex: 1, fontSize: 13.5, fontWeight: done && m.score1 > m.score2 ? 700 : 400 }}>
-                {m.team1.map(nameOf).join(" / ")}
-              </span>
-              <input type="number" min="0" max={pointsPerMatch} disabled={!editable}
-                value={m.score1 === null ? "" : m.score1}
-                onChange={(e) => onScore(roundIndex, mi, "score1", e.target.value)}
-                style={{ ...inputStyle, width: 56, textAlign: "center", fontFamily: FONT_MONO, padding: "6px 4px" }} />
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ flex: 1, fontSize: 13.5, fontWeight: done && m.score2 > m.score1 ? 700 : 400 }}>
-                {m.team2.map(nameOf).join(" / ")}
-              </span>
-              <input type="number" min="0" max={pointsPerMatch} disabled={!editable}
-                value={m.score2 === null ? "" : m.score2}
-                onChange={(e) => onScore(roundIndex, mi, "score2", e.target.value)}
-                style={{ ...inputStyle, width: 56, textAlign: "center", fontFamily: FONT_MONO, padding: "6px 4px" }} />
-            </div>
+            {[["team1", "score1", "score2", "seeds1"], ["team2", "score2", "score1", "seeds2"]].map(([team, fld, other, seedKey]) => (
+              <div key={fld} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: fld === "score1" ? 6 : 0 }}>
+                <span style={{ flex: 1, fontSize: 13.5, fontWeight: saved && Number(m[fld]) > Number(m[other]) ? 700 : 400, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                  {(m[team] || []).map((pid, k) => {
+                    const seed = m[seedKey] ? m[seedKey][k] : null;
+                    return (
+                      <span key={pid} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                        {k > 0 && <span style={{ color: C.slateFaint, marginRight: 1 }}>/</span>}
+                        {nameOf(pid)}
+                        {/* Seat number within this court's group of four, so the
+                            1+4 / 2+3 pairing the schedule used is visible rather
+                            than something players have to infer. */}
+                        {seed != null && (
+                          <span style={{
+                            display: "inline-flex", alignItems: "center", justifyContent: "center",
+                            width: 17, height: 17, borderRadius: "50%", flex: "0 0 auto",
+                            border: `1px solid ${C.slateFaint}`, color: C.slate,
+                            fontSize: 10, fontFamily: FONT_MONO, lineHeight: 1,
+                          }}>{seed}</span>
+                        )}
+                      </span>
+                    );
+                  })}
+                </span>
+                <input type="number" min="0" max={pointsPerMatch} disabled={!editable}
+                  value={m[fld] === null || m[fld] === undefined ? "" : m[fld]}
+                  onChange={(e) => onScore(roundIndex, mi, fld, e.target.value)}
+                  style={{ ...inputStyle, width: 58, textAlign: "center", fontFamily: FONT_MONO, padding: "6px 4px", opacity: editable ? 1 : 0.6 }} />
+              </div>
+            ))}
           </div>
         );
       })}
@@ -332,68 +282,69 @@ function RoundCard({ round, roundIndex, playersById, pointsPerMatch, onScore, ed
   );
 }
 
-function TournamentView({ tournament, players, onBack, onUpdate, canEdit }) {
+// ============================================================================
+// Tournament view
+// ============================================================================
+function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmin }) {
   const [local, setLocal] = useState(tournament);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [withdrawFor, setWithdrawFor] = useState(null);
+  const [withdrawReason, setWithdrawReason] = useState("Травма");
 
   useEffect(() => { setLocal(tournament); }, [tournament.id]);
 
   const playersById = {};
   players.forEach((p) => { playersById[p.id] = p; });
-  const roster = (local.playerIds || []).map((id) => playersById[id]).filter(Boolean);
-  const standings = computeStandings(local, playersById);
+  const standings = computeStandings(local);
+  const active = activePlayerIds(local);
+  const history = buildHistory(local);
 
   const lastRound = local.rounds[local.rounds.length - 1];
-  const lastComplete = !lastRound || lastRound.matches.every((m) => m.score1 !== null && m.score2 !== null);
+  const lastComplete = !lastRound || lastRound.matches.every((m) => m.score1 !== null && m.score1 !== undefined && m.score2 !== null && m.score2 !== undefined);
+  const reachedTarget = local.targetRounds ? local.rounds.length >= local.targetRounds : false;
+  const tooFewActive = active.length < 4;
 
   const persist = async (next) => {
-    setLocal(next);
-    setBusy(true);
-    setMsg("");
+    setLocal(next); setBusy(true); setMsg("");
     try {
       await api(`/api/mexicano/${local.id}`, { method: "PUT", body: next });
       onUpdate(next);
     } catch (e) {
-      setMsg(e.status === 403 ? "Нужен вход через Telegram" : `Не сохранилось: ${e.message}`);
-    } finally {
-      setBusy(false);
-    }
+      setMsg(e.status === 403 ? "Нужен вход через Telegram или в админ-панель" : `Не сохранилось: ${e.message}`);
+    } finally { setBusy(false); }
   };
 
-  // Every match runs to a fixed total, so one side's score fully determines the
-  // other: typing 16 in a race to 24 means the opponents got 8. Filling the
-  // second box automatically removes half the taps on court and makes it
-  // impossible to record a pair of scores that don't add up. Typing into either
-  // box recalculates the other, so a correction works from whichever side is
-  // more natural; clearing a box clears both.
   const onScore = (ri, mi, field, value) => {
     const total = Number(local.pointsPerMatch) || 0;
     const other = field === "score1" ? "score2" : "score1";
-
-    let v = null;
-    let counterpart = null;
+    let v = null, counterpart = null;
     if (value !== "") {
       v = Math.min(Math.max(0, Math.floor(Number(value) || 0)), total);
       counterpart = total - v;
     }
-
-    const next = { ...local, rounds: local.rounds.map((r, i) => (i !== ri ? r : {
+    setLocal({ ...local, rounds: local.rounds.map((r, i) => (i !== ri ? r : {
       ...r, matches: r.matches.map((m, j) => (j !== mi ? m : { ...m, [field]: v, [other]: counterpart })),
-    })) };
-    setLocal(next); // keep typing responsive; persisted via the explicit save button
+    })) });
   };
 
-  const saveScores = () => persist(local);
-
   const nextRound = () => {
-    const round = buildRound(roster, computeStandings(local, playersById), local.courts, local.seeding, local.rounds.length);
+    const round = buildRound(local, playersById, computeStandings(local));
     persist({ ...local, rounds: [...local.rounds, round] });
   };
 
-  const finish = () => persist({ ...local, finished: !local.finished });
+  const doWithdraw = () => {
+    const next = {
+      ...local,
+      withdrawals: [...(local.withdrawals || []), { playerId: withdrawFor, reason: withdrawReason.trim() || "выбыл", round: local.rounds.length }],
+    };
+    setWithdrawFor(null); setWithdrawReason("Травма");
+    persist(next);
+  };
+  const undoWithdraw = (pid) => persist({ ...local, withdrawals: (local.withdrawals || []).filter((w) => w.playerId !== pid) });
 
-  const winner = sortedStandings(standings, playersById)[0];
+  const nameOf = (id) => (playersById[id] ? fullName(playersById[id]) : "—");
+  const winner = sortedStandings(standings, nameOf)[0];
 
   return (
     <div>
@@ -401,10 +352,12 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit }) {
 
       <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap", marginBottom: 4 }}>
         <h2 style={{ fontFamily: FONT_DISPLAY, fontSize: 20, margin: 0 }}>{local.name}</h2>
+        <span style={{ fontSize: 11, color: C.action, border: `1px solid ${C.action}`, borderRadius: 999, padding: "2px 9px" }}>{FORMAT_LABEL[local.format] || "Mexicano"}</span>
         {local.finished && <span style={{ fontSize: 11, color: C.court, border: `1px solid ${C.court}`, borderRadius: 999, padding: "2px 9px" }}>завершён</span>}
       </div>
       <div style={{ fontSize: 12, color: C.slateFaint, marginBottom: 16, fontFamily: FONT_MONO }}>
-        {local.date} · до {local.pointsPerMatch} очков · кортов: {local.courts} · {roster.length} игроков · схема {local.seeding === "1+3" ? "1+3 / 2+4" : "1+4 / 2+3"}
+        {local.date} · до {local.pointsPerMatch} · кортов {local.courts} · {active.length} в игре
+        {local.targetRounds ? ` · раунд ${local.rounds.length}/${local.targetRounds}` : ` · раундов ${local.rounds.length}`}
       </div>
 
       {local.finished && winner && (
@@ -412,14 +365,51 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit }) {
           <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>Победитель</div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <Avatar player={playersById[winner.id]} size={34} />
-            <span style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 17 }}>{playersById[winner.id] ? fullName(playersById[winner.id]) : "—"}</span>
+            <span style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 17 }}>{nameOf(winner.id)}</span>
             <span style={{ fontFamily: FONT_MONO, fontWeight: 700, fontSize: 17, color: C.court, marginLeft: "auto" }}>{winner.points}</span>
           </div>
         </div>
       )}
 
       <h3 style={{ fontSize: 12, color: C.slate, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 10 }}>Таблица</h3>
-      <StandingsTable standings={standings} playersById={playersById} />
+      <StandingsTable tournament={local} standings={standings} playersById={playersById} />
+
+      {canEdit && !local.finished && (
+        <div style={{ marginTop: 12, background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 13 }}>
+          <div style={{ fontSize: 11.5, color: C.slateFaint, marginBottom: 8 }}>Снять игрока с турнира (травма, уход)</div>
+          {withdrawFor ? (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+              <span style={{ fontSize: 13.5, fontWeight: 600 }}>{nameOf(withdrawFor)}</span>
+              <input value={withdrawReason} onChange={(e) => setWithdrawReason(e.target.value)} placeholder="Причина"
+                style={{ ...inputStyle, flex: "1 1 150px" }} />
+              <button onClick={doWithdraw} disabled={busy} style={btn(C.rust)}>Снять</button>
+              <button onClick={() => setWithdrawFor(null)} style={{ ...btn("none", C.slateFaint), border: `1px solid ${C.rule}` }}>Отмена</button>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {active.map((id) => (
+                <button key={id} onClick={() => setWithdrawFor(id)} style={{
+                  fontSize: 12.5, background: C.paper, color: C.ink, border: `1px solid ${C.rule}`,
+                  borderRadius: 999, padding: "5px 11px", cursor: "pointer",
+                }}>{nameOf(id)}</button>
+              ))}
+              {active.length === 0 && <span style={{ fontSize: 12.5, color: C.slateFaint }}>Все игроки сняты.</span>}
+            </div>
+          )}
+          {(local.withdrawals || []).length > 0 && (
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.rule}` }}>
+              {(local.withdrawals || []).map((w) => (
+                <div key={w.playerId} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: C.slate, marginBottom: 4 }}>
+                  <span style={{ textDecoration: "line-through" }}>{nameOf(w.playerId)}</span>
+                  <span style={{ color: C.rust }}>{w.reason}</span>
+                  <span style={{ color: C.slateFaint, fontFamily: FONT_MONO, fontSize: 11 }}>с раунда {(w.round || 0) + 1}</span>
+                  <button onClick={() => undoWithdraw(w.playerId)} style={{ marginLeft: "auto", fontSize: 11.5, background: "none", border: "none", color: C.action, cursor: "pointer" }}>вернуть</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <h3 style={{ fontSize: 12, color: C.slate, textTransform: "uppercase", letterSpacing: "0.06em", margin: "22px 0 10px" }}>
         Раунды {local.rounds.length > 0 && <span style={{ color: C.slateFaint }}>· {local.rounds.length}</span>}
@@ -427,45 +417,57 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit }) {
 
       {local.rounds.length === 0 && (
         <div style={{ background: C.card, border: `1px dashed ${C.rule}`, borderRadius: 12, padding: 22, textAlign: "center", fontSize: 13.5, color: C.slateFaint, marginBottom: 12 }}>
-          Турнир создан. Нажмите «Сформировать раунд», чтобы сделать первую жеребьёвку.
+          Турнир создан. Нажмите «Сформировать раунд» для первой жеребьёвки.
         </div>
       )}
 
       {local.rounds.map((r, i) => (
         <RoundCard key={i} round={r} roundIndex={i} playersById={playersById}
-          pointsPerMatch={local.pointsPerMatch} onScore={onScore} editable={canEdit && !local.finished} />
+          pointsPerMatch={local.pointsPerMatch} onScore={onScore}
+          canEnter={canEdit && !local.finished} canEditSaved={isAdmin} />
       ))}
 
       {msg && <div style={{ fontSize: 12.5, color: C.negative, marginBottom: 10 }}>{msg}</div>}
 
       {canEdit && (
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14, marginBottom: 30 }}>
-          {!local.finished && local.rounds.length > 0 && (
-            <button onClick={saveScores} disabled={busy} style={{ ...btn(C.action), opacity: busy ? 0.5 : 1 }}>
+          {local.rounds.length > 0 && (
+            <button onClick={() => persist(local)} disabled={busy} style={{ ...btn(C.action), opacity: busy ? 0.5 : 1 }}>
               {busy ? "Сохранение…" : "Сохранить счёт"}
             </button>
           )}
           {!local.finished && (
-            <button onClick={nextRound} disabled={busy || !lastComplete}
-              title={!lastComplete ? "Сначала введите счёт всех матчей текущего раунда" : ""}
-              style={{ ...btn(C.court), opacity: busy || !lastComplete ? 0.45 : 1 }}>
-              Сформировать раунд
+            <button onClick={nextRound} disabled={busy || !lastComplete || tooFewActive}
+              title={tooFewActive ? "В игре осталось меньше четырёх" : (!lastComplete ? "Сначала введите счёт всех матчей" : "")}
+              style={{ ...btn(reachedTarget ? C.slate : C.court), opacity: busy || !lastComplete || tooFewActive ? 0.45 : 1 }}>
+              {reachedTarget ? "Сыграть ещё раунд" : "Сформировать раунд"}
             </button>
           )}
-          <button onClick={finish} disabled={busy} style={{ ...btn("none", local.finished ? C.court : C.slate), border: `1px solid ${C.rule}` }}>
+          <button onClick={() => persist({ ...local, finished: !local.finished })} disabled={busy}
+            style={{ ...btn("none", local.finished ? C.court : C.slate), border: `1px solid ${C.rule}` }}>
             {local.finished ? "Вернуть в игру" : "Завершить турнир"}
           </button>
         </div>
       )}
+
+      {canEdit && !isAdmin && (
+        <div style={{ fontSize: 11.5, color: C.slateFaint, marginBottom: 24, lineHeight: 1.45 }}>
+          Исправление уже записанного счёта и удаление турнира доступны только в админ-панели.
+        </div>
+      )}
+
       {!canEdit && (
         <div style={{ fontSize: 12.5, color: C.rust, background: `${C.rust}14`, border: `1px solid ${C.rust}`, borderRadius: 10, padding: "9px 12px", marginTop: 14 }}>
-          Режим просмотра — чтобы вести турнир, войдите через Telegram в основном приложении или авторизуйтесь в админ-панели.
+          Режим просмотра — чтобы вести турнир, войдите через Telegram в приложении или в админ-панель.
         </div>
       )}
     </div>
   );
 }
 
+// ============================================================================
+// Root
+// ============================================================================
 function App() {
   const [data, setData] = useState(null);
   const [loadError, setLoadError] = useState("");
@@ -473,15 +475,12 @@ function App() {
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [session, setSession] = useState(null);
-
   const [isAdmin, setIsAdmin] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(null);
 
   const load = () => {
     fetch("/api/data").then((r) => r.json()).then(setData).catch((e) => setLoadError(String(e)));
     fetch("/api/player/session").then((r) => r.json()).then(setSession).catch(() => setSession({ loggedIn: false }));
-    // An admin signed into the admin panel can run tournaments too, without
-    // having to also be a Telegram-verified player. The server accepts either
-    // session on the /api/mexicano endpoints, so the UI has to recognise both.
     fetch("/api/admin/session").then((r) => r.json()).then((s) => setIsAdmin(!!(s && s.authenticated))).catch(() => setIsAdmin(false));
   };
   useEffect(load, []);
@@ -499,23 +498,20 @@ function App() {
     try {
       const res = await api("/api/mexicano", { method: "POST", body: payload });
       setCreating(false);
-      const next = { ...data, mexicanoTournaments: [...(data.mexicanoTournaments || []), res.tournament] };
-      setData(next);
+      setData({ ...data, mexicanoTournaments: [...(data.mexicanoTournaments || []), res.tournament] });
       setOpenId(res.tournament.id);
     } catch (e) {
-      alert(e.status === 403 ? "Нужен вход через Telegram в основном приложении" : e.message);
+      alert(e.status === 403 ? "Нужен вход через Telegram или в админ-панель" : e.message);
     } finally { setBusy(false); }
   };
 
-  const update = (next) => {
-    setData((d) => ({ ...d, mexicanoTournaments: (d.mexicanoTournaments || []).map((t) => (t.id === next.id ? next : t)) }));
-  };
+  const update = (next) => setData((d) => ({ ...d, mexicanoTournaments: (d.mexicanoTournaments || []).map((t) => (t.id === next.id ? next : t)) }));
 
   const remove = async (id) => {
-    if (!confirm("Удалить этот турнир? Действие необратимо.")) return;
     try {
       await api(`/api/mexicano/${id}`, { method: "DELETE" });
       setData((d) => ({ ...d, mexicanoTournaments: (d.mexicanoTournaments || []).filter((t) => t.id !== id) }));
+      setConfirmDelete(null);
       setOpenId(null);
     } catch (e) { alert(e.message); }
   };
@@ -527,11 +523,12 @@ function App() {
           <a href="/" style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 22, color: C.ink, textDecoration: "none" }}>
             Padel<span style={{ color: C.court }}>Com</span>
           </a>
-          <span style={{ fontSize: 12, color: C.slateFaint, borderLeft: `1px solid ${C.rule}`, paddingLeft: 10 }}>Mexicano</span>
+          <span style={{ fontSize: 12, color: C.slateFaint, borderLeft: `1px solid ${C.rule}`, paddingLeft: 10 }}>Турниры</span>
+          {isAdmin && <span style={{ fontSize: 10.5, color: C.action, border: `1px solid ${C.action}`, borderRadius: 999, padding: "1px 8px" }}>админ</span>}
         </div>
 
         {open ? (
-          <TournamentView tournament={open} players={players} canEdit={canEdit}
+          <TournamentView tournament={open} players={players} canEdit={canEdit} isAdmin={isAdmin}
             onBack={() => setOpenId(null)} onUpdate={update} />
         ) : (
           <>
@@ -547,24 +544,46 @@ function App() {
             )}
 
             {tournaments.map((t) => {
-              const done = (t.rounds || []).reduce((n, r) => n + r.matches.filter((m) => m.score1 !== null).length, 0);
+              const done = (t.rounds || []).reduce((n, r) => n + r.matches.filter((m) => m.score1 !== null && m.score1 !== undefined).length, 0);
+              const out = (t.withdrawals || []).length;
               return (
                 <div key={t.id} style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: "13px 15px", marginBottom: 10, display: "flex", alignItems: "center", gap: 10 }}>
                   <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => setOpenId(t.id)}>
-                    <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 2 }}>
-                      {t.name} {t.finished && <span style={{ fontSize: 10.5, fontWeight: 400, color: C.court, border: `1px solid ${C.court}`, borderRadius: 999, padding: "1px 8px", marginLeft: 4 }}>завершён</span>}
+                    <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 2, display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
+                      {t.name}
+                      <span style={{ fontSize: 10, fontWeight: 600, color: C.action, border: `1px solid ${C.action}`, borderRadius: 999, padding: "1px 7px" }}>{FORMAT_LABEL[t.format] || "Mexicano"}</span>
+                      {t.finished && <span style={{ fontSize: 10, fontWeight: 400, color: C.court, border: `1px solid ${C.court}`, borderRadius: 999, padding: "1px 7px" }}>завершён</span>}
                     </div>
                     <div style={{ fontSize: 12, color: C.slateFaint, fontFamily: FONT_MONO }}>
-                      {t.date} · {(t.playerIds || []).length} игроков · раундов: {(t.rounds || []).length} · матчей сыграно: {done}
+                      {t.date} · {(t.playerIds || []).length} игроков{out > 0 ? ` (−${out})` : ""} · раундов {(t.rounds || []).length}{t.targetRounds ? `/${t.targetRounds}` : ""} · матчей {done}
                     </div>
                   </div>
-                  {canEdit && (
-                    <button onClick={() => remove(t.id)} title="Удалить"
-                      style={{ background: "none", border: "none", color: C.negative, cursor: "pointer", fontSize: 18, lineHeight: 1, padding: 4 }}>×</button>
+                  {/* Deleting a tournament is destructive and permanent, so it is
+                      an admin-only action rather than something any player
+                      running a match can trigger by mistake. */}
+                  {isAdmin && (
+                    <button onClick={() => setConfirmDelete(t)} title="Удалить"
+                      style={{ background: "none", border: "none", color: C.negative, cursor: "pointer", fontSize: 19, lineHeight: 1, padding: 4 }}>×</button>
                   )}
                 </div>
               );
             })}
+          </>
+        )}
+
+        {confirmDelete && (
+          <>
+            <div onClick={() => setConfirmDelete(null)} style={{ position: "fixed", inset: 0, zIndex: 900, background: "rgba(26,27,29,0.45)" }} />
+            <div style={{ position: "fixed", top: "50%", left: "50%", transform: "translate(-50%,-50%)", zIndex: 901, background: C.card, borderRadius: 14, padding: 20, width: "min(92vw, 360px)" }}>
+              <div style={{ fontSize: 14.5, marginBottom: 6 }}>Удалить турнир «{confirmDelete.name}»?</div>
+              <div style={{ fontSize: 12.5, color: C.slateFaint, marginBottom: 16 }}>
+                Будут удалены все раунды и результаты. Действие необратимо.
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => remove(confirmDelete.id)} style={{ ...btn(C.negative), flex: 1 }}>Удалить</button>
+                <button onClick={() => setConfirmDelete(null)} style={{ ...btn("none", C.slate), border: `1px solid ${C.rule}`, flex: 1 }}>Отмена</button>
+              </div>
+            </div>
           </>
         )}
       </div>
