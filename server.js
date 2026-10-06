@@ -1138,6 +1138,43 @@ async function processTelegramUpdate(update, data) {
     return;
   }
 
+  // ---- PCR questionnaire ----
+  // One player's answers and the starting level they produce. A player may only
+  // write their own; an admin may write anyone's, which is also the route for
+  // correcting a questionnaire after the fact, since players can't retake it.
+  if (url === "/api/pcr/questionnaire" && req.method === "PUT") {
+    const session = playerSessionFromRequest(req);
+    const admin = isAdminRequest(req);
+    if (!session && !admin) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const targetId = admin && body.playerId ? body.playerId : (session && session.playerId);
+      if (!targetId) { send(res, 400, JSON.stringify({ error: "no player" }), { "Content-Type": "application/json" }); return; }
+      let found = false;
+      await updateBlob((data) => {
+        data.players = (data.players || []).map((p) => {
+          if (p.id !== targetId) return p;
+          found = true;
+          return {
+            ...p,
+            pcrQuestionnaire: {
+              answers: body.answers && typeof body.answers === "object" ? body.answers : {},
+              level: Number(body.level) || 0,
+              completedAt: new Date().toISOString(),
+              byAdmin: !!admin && !!body.playerId,
+            },
+          };
+        });
+        return data;
+      });
+      if (!found) { send(res, 404, JSON.stringify({ error: "player not found" }), { "Content-Type": "application/json" }); return; }
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
   // ---- Mexicano tournaments ----
   // Kept on their own endpoints rather than riding the whole-blob /api/data save:
   // a tournament is edited round-by-round, live on court, while other people may
@@ -1261,10 +1298,16 @@ async function processTelegramUpdate(update, data) {
           const currentPlayers = current.players || [];
           incoming.players = (incoming.players || []).map((p) => {
             const curPlayer = currentPlayers.find((cp) => cp.id === p.id);
+            let merged = p;
             if (curPlayer && curPlayer.telegramVerified && !p.telegramVerified) {
-              return { ...p, telegramVerified: curPlayer.telegramVerified, telegramUserId: curPlayer.telegramUserId };
+              merged = { ...merged, telegramVerified: curPlayer.telegramVerified, telegramUserId: curPlayer.telegramUserId };
             }
-            return p;
+            // The PCR questionnaire is written by its own endpoint and the regular
+            // app client never sends the field, so a plain save would drop it.
+            if (curPlayer && curPlayer.pcrQuestionnaire && !p.pcrQuestionnaire) {
+              merged = { ...merged, pcrQuestionnaire: curPlayer.pcrQuestionnaire };
+            }
+            return merged;
           });
           // ntrpScale is admin-only (edited from the admin panel, never sent by the
           // regular app client since it doesn't include this field in its save
