@@ -1250,6 +1250,77 @@ async function processTelegramUpdate(update, data) {
     return;
   }
 
+  // ---- teams (corporate / group rosters) ----
+  // Written exclusively through these endpoints so a stale /api/data autosave
+  // can never wipe a roster someone else just created (same pattern as
+  // mexicanoTournaments and matchRecords).
+  if (url === "/api/teams" && req.method === "POST") {
+    if (!playerSessionFromRequest(req) && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const body = await readJsonBody(req);
+      const name = String(body.name || "").trim();
+      if (!name) { send(res, 400, JSON.stringify({ error: "name required" }), { "Content-Type": "application/json" }); return; }
+      let created = null;
+      await updateBlob((data) => {
+        created = {
+          id: crypto.randomUUID().slice(0, 8),
+          name,
+          note: String(body.note || "").trim(),
+          playerIds: Array.isArray(body.playerIds) ? body.playerIds.filter((x) => typeof x === "string") : [],
+          createdAt: new Date().toISOString(),
+        };
+        data.teams = [...(data.teams || []), created];
+        return data;
+      });
+      send(res, 200, JSON.stringify({ ok: true, team: created }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url.startsWith("/api/teams/") && req.method === "PUT") {
+    if (!playerSessionFromRequest(req) && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    const id = decodeURIComponent(url.slice("/api/teams/".length));
+    try {
+      const body = await readJsonBody(req);
+      let found = false;
+      await updateBlob((data) => {
+        data.teams = (data.teams || []).map((t) => {
+          if (t.id !== id) return t;
+          found = true;
+          const next = { ...t };
+          if (body.name !== undefined) next.name = String(body.name || "").trim() || t.name;
+          if (body.note !== undefined) next.note = String(body.note || "").trim();
+          if (Array.isArray(body.playerIds)) next.playerIds = body.playerIds.filter((x) => typeof x === "string");
+          // id/createdAt are server-owned and never taken from the client.
+          return { ...next, id: t.id, createdAt: t.createdAt };
+        });
+        return data;
+      });
+      if (!found) { send(res, 404, JSON.stringify({ error: "not found" }), { "Content-Type": "application/json" }); return; }
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
+  if (url.startsWith("/api/teams/") && req.method === "DELETE") {
+    if (!playerSessionFromRequest(req) && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    const id = decodeURIComponent(url.slice("/api/teams/".length));
+    try {
+      await updateBlob((data) => {
+        data.teams = (data.teams || []).filter((t) => t.id !== id);
+        return data;
+      });
+      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
   if (url === "/api/data" && (req.method === "PUT" || req.method === "POST")) {
     // Real enforcement point: only a verified player (or the admin, via its own
     // /api/admin/* endpoints) may write. Hiding buttons in the UI is just
@@ -1331,6 +1402,8 @@ async function processTelegramUpdate(update, data) {
           // next autosave. Server state always wins here; deletion goes through
           // the dedicated DELETE endpoint, never through this general save.
           incoming.mexicanoTournaments = current.mexicanoTournaments || [];
+          // Teams are written exclusively through /api/teams/* — same reasoning.
+          incoming.teams = current.teams || [];
 
           const incomingMatchIds = new Set((incoming.matchRecords || []).map((m) => m.id));
           const missingMatches = (current.matchRecords || []).filter((m) => !incomingMatchIds.has(m.id));
@@ -1347,7 +1420,7 @@ async function processTelegramUpdate(update, data) {
   }
 
   // ---- static files ----
-  let filePath = path.join(PUBLIC_DIR, url === "/" ? "index.html" : (url === "/admin" ? "admin.html" : (url === "/mexicano" ? "mexicano.html" : (url === "/rating" ? "rating.html" : url))));
+  let filePath = path.join(PUBLIC_DIR, url === "/" ? "index.html" : (url === "/admin" ? "admin.html" : (url === "/mexicano" ? "mexicano.html" : (url === "/rating" ? "rating.html" : (url === "/teams" ? "teams.html" : url)))));
   if (!filePath.startsWith(PUBLIC_DIR)) {
     return send(res, 403, "Forbidden");
   }

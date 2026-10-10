@@ -4,6 +4,7 @@ import {
   FORMATS, buildRound, computeStandings, sortedStandings, buildHistory,
   activePlayerIds, recommendedRounds, restIsEven, playingCount,
 } from "./engine.js";
+import { computePCR } from "./pcr.js";
 
 // ---------- design tokens (kept in sync with the main app) ----------
 const C = {
@@ -57,7 +58,7 @@ function Avatar({ player, size = 26, dim }) {
 // ============================================================================
 // Create form
 // ============================================================================
-function CreateForm({ players, onCreate, onCancel, busy }) {
+function CreateForm({ players, teams, onCreate, onCancel, busy }) {
   const [format, setFormat] = useState(FORMATS.MEXICANO);
   const [name, setName] = useState("");
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
@@ -67,8 +68,23 @@ function CreateForm({ players, onCreate, onCancel, busy }) {
   const [selected, setSelected] = useState([]);
   const [targetRounds, setTargetRounds] = useState("");
   const [touchedRounds, setTouchedRounds] = useState(false);
+  const [teamId, setTeamId] = useState("");
 
   const toggle = (id) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  // A team is a roster filter over the general player list, nothing more: the
+  // organiser still ticks who actually turned up. Picking a team never drops
+  // anyone already selected — those stay in the tournament and are counted in
+  // the "ещё N вне команды" note below, so nobody vanishes silently.
+  const team = teams.find((t) => t.id === teamId) || null;
+  const teamIdSet = team ? new Set(team.playerIds || []) : null;
+  const visiblePlayers = teamIdSet ? players.filter((p) => teamIdSet.has(p.id)) : players;
+  const hiddenSelected = selected.filter((id) => !visiblePlayers.some((p) => p.id === id)).length;
+  const allVisibleOn = visiblePlayers.length > 0 && visiblePlayers.every((p) => selected.includes(p.id));
+  const toggleAllVisible = () => setSelected((s) => (
+    allVisibleOn
+      ? s.filter((id) => !visiblePlayers.some((p) => p.id === id))
+      : [...new Set([...s, ...visiblePlayers.map((p) => p.id)])]
+  ));
   const enough = selected.length >= 4;
   const willPlay = playingCount(selected.length, courts);
   const willSit = selected.length - willPlay;
@@ -149,13 +165,36 @@ function CreateForm({ players, onCreate, onCancel, busy }) {
         </div>
       )}
 
+      {teams.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", gap: 10, marginBottom: 12 }}>
+          <div style={{ flex: "1 1 200px" }}>
+            <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Команда</div>
+            <select value={teamId} onChange={(e) => setTeamId(e.target.value)} style={{ ...inputStyle, width: "100%" }}>
+              <option value="">Все игроки</option>
+              {teams.map((t) => (
+                <option key={t.id} value={t.id}>{t.name} ({(t.playerIds || []).length})</option>
+              ))}
+            </select>
+          </div>
+          {team && (
+            <button onClick={toggleAllVisible} style={{ ...btn("none", C.action), border: `1px solid ${C.rule}`, padding: "9px 14px" }}>
+              {allVisibleOn ? "Снять всех" : `Выбрать всех (${visiblePlayers.length})`}
+            </button>
+          )}
+        </div>
+      )}
+
       <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 6 }}>
         Участники — выбрано {selected.length}
         {selected.length > 0 && !enough && <span style={{ color: C.rust }}> · нужно минимум 4</span>}
         {enough && <span> · играют {willPlay}{willSit > 0 ? `, отдыхают ${willSit}` : ""}</span>}
+        {team && hiddenSelected > 0 && <span style={{ color: C.action }}> · ещё {hiddenSelected} вне команды</span>}
       </div>
+      {team && visiblePlayers.length === 0 && (
+        <div style={{ fontSize: 12.5, color: C.rust, marginBottom: 14 }}>В команде «{team.name}» пока нет игроков.</div>
+      )}
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14, maxHeight: 230, overflowY: "auto" }}>
-        {players.map((p) => {
+        {visiblePlayers.map((p) => {
           const on = selected.includes(p.id);
           return (
             <button key={p.id} onClick={() => toggle(p.id)} style={{
@@ -285,7 +324,7 @@ function RoundCard({ round, roundIndex, playersById, pointsPerMatch, onScore, ca
 // ============================================================================
 // Tournament view
 // ============================================================================
-function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmin }) {
+function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmin, levels }) {
   const [local, setLocal] = useState(tournament);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
@@ -329,7 +368,7 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmi
   };
 
   const nextRound = () => {
-    const round = buildRound(local, playersById, computeStandings(local));
+    const round = buildRound(local, playersById, computeStandings(local), levels);
     persist({ ...local, rounds: [...local.rounds, round] });
   };
 
@@ -489,7 +528,13 @@ function App() {
   if (!data) return <div style={{ minHeight: "60vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FONT_DISPLAY, fontSize: 22, color: C.court }}>PadelCom</div>;
 
   const canEdit = !!(session && session.loggedIn) || isAdmin;
+  // Match balance is measured against PC Rating rather than points scored so
+  // far: in the opening rounds the tournament's own table is almost empty and
+  // tells you nothing, while PC Rating already reflects every game on record.
+  const pcrLevels = {};
+  computePCR(data).forEach((r) => { pcrLevels[r.id] = r.rating; });
   const players = (data.players || []).slice().sort((a, b) => fullName(a).localeCompare(fullName(b)));
+  const teams = [...(data.teams || [])].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   const tournaments = [...(data.mexicanoTournaments || [])].reverse();
   const open = tournaments.find((t) => t.id === openId);
 
@@ -528,14 +573,14 @@ function App() {
         </div>
 
         {open ? (
-          <TournamentView tournament={open} players={players} canEdit={canEdit} isAdmin={isAdmin}
+          <TournamentView tournament={open} players={players} canEdit={canEdit} isAdmin={isAdmin} levels={pcrLevels}
             onBack={() => setOpenId(null)} onUpdate={update} />
         ) : (
           <>
             {canEdit && !creating && (
               <button onClick={() => setCreating(true)} style={{ ...btn(C.ink), width: "100%", marginBottom: 16 }}>+ Новый турнир</button>
             )}
-            {creating && <CreateForm players={players} onCreate={create} onCancel={() => setCreating(false)} busy={busy} />}
+            {creating && <CreateForm players={players} teams={teams} onCreate={create} onCancel={() => setCreating(false)} busy={busy} />}
 
             {tournaments.length === 0 && !creating && (
               <div style={{ background: C.card, border: `1px dashed ${C.rule}`, borderRadius: 12, padding: 26, textAlign: "center", fontSize: 13.5, color: C.slateFaint }}>
