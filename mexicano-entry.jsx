@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 import {
   FORMATS, buildRound, computeStandings, sortedStandings, buildHistory,
@@ -524,6 +524,16 @@ function App() {
   };
   useEffect(load, []);
 
+  // Хук обязан стоять ДО любых ранних return. Полный пересчёт истории стоит
+  // десятки миллисекунд — привязываем его к данным, иначе он гонялся бы на
+  // каждое нажатие клавиши в форме создания турнира.
+  const pcrLevels = useMemo(() => {
+    const out = {};
+    if (!data) return out;
+    computePCR(data).forEach((r) => { out[r.id] = r.rating; });
+    return out;
+  }, [data]);
+
   if (loadError) return <div style={{ padding: 24, fontFamily: FONT_BODY, color: C.negative }}>Не удалось загрузить данные: {loadError}</div>;
   if (!data) return <div style={{ minHeight: "60vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FONT_DISPLAY, fontSize: 22, color: C.court }}>PadelCom</div>;
 
@@ -531,8 +541,7 @@ function App() {
   // Match balance is measured against PC Rating rather than points scored so
   // far: in the opening rounds the tournament's own table is almost empty and
   // tells you nothing, while PC Rating already reflects every game on record.
-  const pcrLevels = {};
-  computePCR(data).forEach((r) => { pcrLevels[r.id] = r.rating; });
+
   const players = (data.players || []).slice().sort((a, b) => fullName(a).localeCompare(fullName(b)));
   const teams = [...(data.teams || [])].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   const tournaments = [...(data.mexicanoTournaments || [])].reverse();

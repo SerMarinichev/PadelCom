@@ -1,9 +1,10 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 import { buildRating, explainRow, MIN_GAMES_RELIABLE } from "./rating.js";
 import {
   QUESTIONNAIRE, scoreQuestionnaire, computePCR, weeklySeries, ntrpRows,
-  INITIAL_WEIGHT, SCALE_MAX,
+  recentChange, headToHead, ratedRows, calibrationReport,
+  MIN_RATED_GAMES, INITIAL_WEIGHT, SCALE_MAX, ELO_BASE,
 } from "./pcr.js";
 
 const C = {
@@ -144,14 +145,14 @@ function NtrpTable({ rows, playersById }) {
 // ============================================================================
 function WeeklyBars({ series }) {
   if (!series.length) return <div style={{ fontSize: 12, color: C.slateFaint }}>Недостаточно игр для динамики.</div>;
-  const peak = Math.max(0.05, ...series.map((s) => Math.abs(s.delta)));
+  const peak = Math.max(1, ...series.map((s) => Math.abs(s.delta)));
   return (
     <div style={{ display: "flex", gap: 6, alignItems: "flex-end", overflowX: "auto", paddingBottom: 4 }}>
       {series.map((s) => {
         const up = s.delta >= 0;
         const h = Math.max(3, (Math.abs(s.delta) / peak) * 34);
         return (
-          <div key={s.key} style={{ flex: "0 0 auto", width: 46, textAlign: "center" }}>
+          <div key={s.key} style={{ flex: "0 0 auto", width: 50, textAlign: "center" }}>
             <div style={{ height: 38, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
               {up && <div style={{ width: 20, height: h, background: C.positive, borderRadius: "4px 4px 0 0" }} />}
             </div>
@@ -160,7 +161,7 @@ function WeeklyBars({ series }) {
               {!up && <div style={{ width: 20, height: h, background: C.negative, borderRadius: "0 0 4px 4px" }} />}
             </div>
             <div style={{ fontSize: 10.5, fontFamily: FM, color: up ? C.positive : C.negative, fontWeight: 700 }}>
-              {up ? "+" : ""}{s.delta.toFixed(2)}
+              {up ? "+" : ""}{s.delta}
             </div>
             <div style={{ fontSize: 9.5, color: C.slateFaint, fontFamily: FM }}>{s.label}</div>
             <div style={{ fontSize: 9, color: C.slateFaint }}>{s.games} игр</div>
@@ -171,63 +172,207 @@ function WeeklyBars({ series }) {
   );
 }
 
+// Кто с кем и против кого — именно на этих встречах рейтинг и построен.
+function H2HList({ title, entries, playersById, limit = 6 }) {
+  if (!entries.length) return null;
+  return (
+    <div style={{ flex: "1 1 220px", minWidth: 0 }}>
+      <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>{title}</div>
+      {entries.slice(0, limit).map((e) => {
+        const p = playersById[e.id];
+        const share = e.pointsFor + e.pointsAgainst ? e.pointsFor / (e.pointsFor + e.pointsAgainst) : 0.5;
+        return (
+          <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, padding: "3px 0" }}>
+            <Avatar player={p} size={20} />
+            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p ? fullName(p) : e.id}</span>
+            <span style={{ fontFamily: FM, fontSize: 11.5, color: C.slateFaint }}>{e.wins}–{e.games - e.wins}</span>
+            <span style={{ fontFamily: FM, fontSize: 11.5, width: 42, textAlign: "right", color: share >= 0.5 ? C.positive : C.negative }}>
+              {Math.round(share * 100)}%
+            </span>
+          </div>
+        );
+      })}
+      {entries.length > limit && <div style={{ fontSize: 11, color: C.slateFaint, marginTop: 3 }}>и ещё {entries.length - limit}</div>}
+    </div>
+  );
+}
+
+// Последние матчи с вкладом каждого в рейтинг — чтобы на вопрос «почему у меня
+// столько» можно было ответить матчем, а не формулой.
+function ContributionList({ row, playersById, limit = 8 }) {
+  const items = row.history.slice(-limit).reverse();
+  if (!items.length) return null;
+  const nameOf = (id) => (playersById[id] ? fullName(playersById[id]) : id);
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Последние матчи</div>
+      {items.map((h, i) => {
+        const g = h.game;
+        const mine = g.sideA.includes(row.id) ? g.sideA : g.sideB;
+        const theirs = g.sideA.includes(row.id) ? g.sideB : g.sideA;
+        const myScore = g.sideA.includes(row.id) ? g.scoreA : g.scoreB;
+        const theirScore = g.sideA.includes(row.id) ? g.scoreB : g.scoreA;
+        const partner = mine.find((id) => id !== row.id);
+        return (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, padding: "5px 0", borderTop: i ? `1px solid ${C.rule}` : "none" }}>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {partner ? `с ${nameOf(partner)}` : "в одиночку"} против {theirs.map(nameOf).join(" / ")}
+              </span>
+              <span style={{ display: "block", fontSize: 10.5, color: C.slateFaint }}>
+                {g.date} · {g.label} · ожидалось {Math.round(h.expected * 100)}%, вышло {Math.round(h.share * 100)}%
+              </span>
+            </span>
+            <span style={{ fontFamily: FM, fontSize: 12, width: 48, textAlign: "right" }}>{myScore}:{theirScore}</span>
+            <span style={{ fontFamily: FM, fontSize: 12.5, fontWeight: 700, width: 44, textAlign: "right", color: h.delta >= 0 ? C.positive : C.negative }}>
+              {h.delta > 0 ? "+" : ""}{h.delta}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function PcrRow({ r, i, playersById, rows, provisional, refDate }) {
+  const [open, setOpen] = useState(false);
+  const p = playersById[r.id];
+  const series = open ? weeklySeries(r) : [];
+  const h2h = open ? headToHead(rows, r.id) : { partners: [], opponents: [] };
+  const recent = recentChange(r, 30, refDate);
+  return (
+    <div>
+      <div onClick={() => setOpen((o) => !o)} style={{ display: "flex", alignItems: "center", padding: "10px 13px", borderTop: `1px solid ${C.rule}`, cursor: "pointer", background: i === 0 && !provisional ? "#F7F5FD" : C.card }}>
+        <span style={{ width: 26, fontFamily: FM, fontSize: 12.5, fontWeight: i < 3 && !provisional ? 700 : 400, color: i < 3 && !provisional ? MEDAL[i] : C.slateFaint }}>
+          {provisional ? "—" : i + 1}
+        </span>
+        <span style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, fontSize: 13.5, minWidth: 0 }}>
+          <Avatar player={p} size={26} />
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p ? fullName(p) : r.id}</span>
+        </span>
+        <span style={{ width: 56, textAlign: "right", fontFamily: FM, fontWeight: 700, fontSize: 15, color: provisional ? C.slateFaint : C.violet }}>{r.elo}</span>
+        <span style={{ width: 52, textAlign: "right", fontFamily: FM, fontSize: 12 }}>
+          {recent && recent.delta !== 0
+            ? <span style={{ color: recent.delta > 0 ? C.positive : C.negative }}>{recent.delta > 0 ? "▲" : "▼"}{Math.abs(recent.delta)}</span>
+            : <span style={{ color: C.slateFaint }}>—</span>}
+        </span>
+        <span style={{ width: 44, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slate }}>{r.rating.toFixed(1)}</span>
+        <span style={{ width: 38, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slateFaint }}>{r.games}</span>
+      </div>
+
+      {open && (
+        <div style={{ padding: "12px 13px 14px", background: C.paperDim, borderTop: `1px solid ${C.rule}` }}>
+          <div style={{ fontSize: 12.5, color: C.slate, marginBottom: 12, lineHeight: 1.6 }}>
+            Рейтинг <b style={{ color: C.violet }}>{r.elo}</b> (уровень {r.rating.toFixed(2)}) · старт {r.startElo} из источника «{r.initialSource}»
+            {r.change !== 0 && <> · {r.change > 0 ? "рост" : "снижение"} на {Math.abs(r.change)} очков</>}
+            <br />
+            Сыграно {r.games} — {r.wins} побед, {r.losses} поражений, доля очков {r.pointShare != null ? Math.round(r.pointShare * 100) + "%" : "—"} · надёжность {Math.round(r.reliability * 100)}%
+            {provisional && <><br /><span style={{ color: C.rust }}>В зачёт не идёт: нужно минимум {MIN_RATED_GAMES} матча.</span></>}
+          </div>
+          <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Динамика по неделям</div>
+          <WeeklyBars series={series} />
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 18, marginTop: 14 }}>
+            <H2HList title="В паре с" entries={h2h.partners} playersById={playersById} />
+            <H2HList title="Против" entries={h2h.opponents} playersById={playersById} />
+          </div>
+          <ContributionList row={r} playersById={playersById} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PcrTable({ rows, playersById }) {
-  const [open, setOpen] = useState(null);
+  const [showCalibration, setShowCalibration] = useState(false);
   if (!rows.length) return <div style={{ ...panel, padding: 24, textAlign: "center", fontSize: 13.5, color: C.slateFaint, border: `1px dashed ${C.rule}` }}>Нет игроков.</div>;
+  const rated = rows.filter((r) => r.rated);
+  const provisional = rows.filter((r) => !r.rated && r.games > 0);
+  const untouched = rows.filter((r) => r.games === 0);
+  // Окно динамики отсчитывается от последней сыгранной игры, а не от сегодня.
+  const refDate = rows.lastGameDate ? new Date(rows.lastGameDate) : new Date();
+
+  const head = (
+    <div style={headRow}>
+      <span style={{ width: 26 }}>#</span><span style={{ flex: 1 }}>Игрок</span>
+      <span style={{ width: 56, textAlign: "right" }}>Рейтинг</span>
+      <span style={{ width: 52, textAlign: "right" }}>30 дн.</span>
+      <span style={{ width: 44, textAlign: "right" }}>Ур.</span>
+      <span style={{ width: 38, textAlign: "right" }}>Игр</span>
+    </div>
+  );
+
   return (
     <>
       <div style={note}>
-        <b>PC Rating</b> — уровень по шкале 0–7. Стартовое значение берётся из анкеты, дальше каждая
-        игра двигает его в сторону фактического результата с учётом силы соперников. Чем больше
-        сыграно, тем меньше влияет одна игра — это показывает <b>надёжность</b>. Нажмите на строку,
-        чтобы увидеть динамику по неделям.
+        <b>PC Rating</b> — рейтинг по модели Elo с поправкой на счёт. Учитываются все матчи и все
+        раунды турниров Mexicano и Americano: рейтинг пары — среднее партнёров, и после каждого
+        матча обе стороны сдвигаются на столько, насколько результат разошёлся с ожидаемым. Чем
+        крупнее разрыв в счёте, тем сильнее сдвиг; матч до 32 весит больше, чем до 12.
+        Вся история пересчитывается заново при каждом обновлении, поэтому порядок матчей на итог
+        не влияет. Колонка <b>30 дн.</b> — движение за 30 дней до последней сыгранной
+        в сообществе игры{rows.lastGameDate ? ` (${rows.lastGameDate})` : ""}; у тех, кто в этот
+        месяц не играл, стоит прочерк.
+        Игроки менее {MIN_RATED_GAMES} матчей в зачёт не идут.
+        Нажмите на строку, чтобы увидеть динамику, встречи и вклад каждого матча.
       </div>
+
       <div style={panel}>
-        <div style={headRow}>
-          <span style={{ width: 26 }}>#</span><span style={{ flex: 1 }}>Игрок</span>
-          <span style={{ width: 54, textAlign: "right" }}>PCR</span>
-          <span style={{ width: 54, textAlign: "right" }}>Старт</span>
-          <span style={{ width: 54, textAlign: "right" }}>Надёж.</span>
+        {head}
+        {rated.map((r, i) => <PcrRow key={r.id} r={r} i={i} playersById={playersById} rows={rows} refDate={refDate} />)}
+      </div>
+
+      {provisional.length > 0 && (
+        <>
+          <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.06em", margin: "18px 0 8px" }}>
+            Недостаточно матчей — вне зачёта
+          </div>
+          <div style={panel}>
+            {head}
+            {provisional.map((r, i) => <PcrRow key={r.id} r={r} i={i} playersById={playersById} rows={rows} refDate={refDate} provisional />)}
+          </div>
+        </>
+      )}
+
+      {untouched.length > 0 && (
+        <div style={{ fontSize: 12, color: C.slateFaint, marginTop: 14, lineHeight: 1.5 }}>
+          Ещё {untouched.length} {untouched.length === 1 ? "игрок" : "игроков"} без единого сыгранного матча — появятся в таблице после первой игры.
         </div>
-        {rows.map((r, i) => {
-          const p = playersById[r.id];
-          const isOpen = open === r.id;
-          const series = isOpen ? weeklySeries(r) : [];
-          return (
-            <div key={r.id}>
-              <div onClick={() => setOpen(isOpen ? null : r.id)} style={{ display: "flex", alignItems: "center", padding: "10px 13px", borderTop: `1px solid ${C.rule}`, cursor: "pointer", background: i === 0 ? "#F7F5FD" : C.card }}>
-                <span style={{ width: 26, fontFamily: FM, fontSize: 12.5, fontWeight: i < 3 ? 700 : 400, color: i < 3 ? MEDAL[i] : C.slateFaint }}>{i + 1}</span>
-                <span style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, fontSize: 13.5, minWidth: 0 }}>
-                  <Avatar player={p} size={26} />
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p ? fullName(p) : r.id}</span>
-                </span>
-                <span style={{ width: 54, textAlign: "right", fontFamily: FM, fontWeight: 700, fontSize: 14.5, color: C.violet }}>{r.rating.toFixed(2)}</span>
-                <span style={{ width: 54, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slateFaint }}>
-                  {r.initial.toFixed(1)}
-                  {r.change !== 0 && (
-                    <span style={{ display: "block", fontSize: 10, color: r.change > 0 ? C.positive : C.negative }}>
-                      {r.change > 0 ? "+" : ""}{r.change.toFixed(2)}
-                    </span>
-                  )}
-                </span>
-                <span style={{ width: 54, textAlign: "right", fontFamily: FM, fontSize: 12, color: r.reliability > 0.5 ? C.positive : C.slateFaint }}>
-                  {Math.round(r.reliability * 100)}%
-                </span>
-              </div>
-              {isOpen && (
-                <div style={{ padding: "12px 13px 14px", background: C.paperDim, borderTop: `1px solid ${C.rule}` }}>
-                  <div style={{ fontSize: 12.5, color: C.slate, marginBottom: 10, lineHeight: 1.6 }}>
-                    Стартовый уровень {r.initial.toFixed(1)} ({r.initialSource}) · сыграно {r.games} · надёжность {Math.round(r.reliability * 100)}%
-                    <br />Текущий PCR <b style={{ color: C.violet }}>{r.rating.toFixed(2)}</b>
-                    {r.change !== 0 && <> — это {r.change > 0 ? "рост" : "снижение"} на {Math.abs(r.change).toFixed(2)} от старта</>}
-                  </div>
-                  <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Динамика по неделям</div>
-                  <WeeklyBars series={series} />
+      )}
+
+      <div style={{ marginTop: 16 }}>
+        <button onClick={() => setShowCalibration((v) => !v)} style={{
+          fontSize: 12, color: C.slateFaint, background: "none", border: "none",
+          cursor: "pointer", padding: 0, textDecoration: "underline",
+        }}>{showCalibration ? "Скрыть проверку модели" : "Как проверить, что модель не врёт"}</button>
+        {showCalibration && (
+          <div style={{ ...note, marginTop: 8 }}>
+            Модель исходит из того, что разрыв в один уровень (300 очков) — это примерно 24:12 по счёту.
+            Таблица ниже сверяет это допущение с фактом: для каждого диапазона разрыва показано, какую
+            долю очков фаворит должен был набрать и какую набрал на самом деле. Расхождение в пределах
+            ±0.03 — норма. Устойчивое расхождение в одну сторону означает, что модель пора
+            перекалибровать.
+            {rows.calibration && rows.calibration.length > 0 ? (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ display: "flex", fontSize: 10.5, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", paddingBottom: 4 }}>
+                  <span style={{ flex: 1 }}>Разрыв</span>
+                  <span style={{ width: 54, textAlign: "right" }}>Матчей</span>
+                  <span style={{ width: 58, textAlign: "right" }}>Факт</span>
+                  <span style={{ width: 66, textAlign: "right" }}>Ожидалось</span>
                 </div>
-              )}
-            </div>
-          );
-        })}
+                {rows.calibration.map((b) => (
+                  <div key={b.label} style={{ display: "flex", fontSize: 12, fontFamily: FM, padding: "3px 0", borderTop: `1px solid ${C.rule}` }}>
+                    <span style={{ flex: 1 }}>{b.label}</span>
+                    <span style={{ width: 54, textAlign: "right", color: C.slateFaint }}>{b.games}</span>
+                    <span style={{ width: 58, textAlign: "right", color: Math.abs(b.gap) > 0.03 ? C.rust : C.ink }}>{b.observed.toFixed(2)}</span>
+                    <span style={{ width: 66, textAlign: "right", color: C.slateFaint }}>{b.predicted.toFixed(2)}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ marginTop: 8, color: C.slateFaint }}>Матчей пока слишком мало для проверки.</div>
+            )}
+          </div>
+        )}
       </div>
     </>
   );
@@ -364,15 +509,17 @@ function QuestionnaireForm({ me, players, isAdmin, onSaved }) {
 // ============================================================================
 // Root
 // ============================================================================
+// PC Rating идёт первым и открывается по умолчанию: это и есть рейтинг.
+// Остальные вкладки — описательная статистика, а не ранжирование.
 const TABS = [
-  ["all", "Всё"], ["tournaments", "Турниры"], ["matches", "Матчи"],
-  ["ntrp", "NTRP"], ["pcr", "PC Rating"],
+  ["pcr", "PC Rating"], ["all", "Всё"], ["tournaments", "Турниры"],
+  ["matches", "Матчи"], ["ntrp", "NTRP"],
 ];
 
 function App() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState("");
-  const [tab, setTab] = useState("all");
+  const [tab, setTab] = useState("pcr");
   const [sub, setSub] = useState("pcr");       // PC Rating sub-tab: pcr | form
   const [session, setSession] = useState(null);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -386,6 +533,16 @@ function App() {
   };
   useEffect(load, []);
 
+  // Хук обязан стоять ДО любых ранних return: React требует одинакового
+  // порядка хуков на каждом рендере. Полный пересчёт истории стоит десятки
+  // миллисекунд, поэтому он привязан к самим данным, а не к рендеру.
+  const pcrRows = useMemo(() => {
+    if (!data) return [];
+    const rows = computePCR(data);
+    rows.calibration = calibrationReport(data, rows);
+    return rows;
+  }, [data]);
+
   if (err) return <div style={{ padding: 24, fontFamily: FB, color: C.negative }}>Не удалось загрузить данные: {err}</div>;
   if (!data) return <div style={{ minHeight: "50vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FD, fontSize: 20, color: C.court }}>PadelCom</div>;
 
@@ -393,6 +550,7 @@ function App() {
   (data.players || []).forEach((p) => { playersById[p.id] = p; });
   const players = (data.players || []).slice().sort((a, b) => fullName(a).localeCompare(fullName(b)));
   const me = session && session.loggedIn ? playersById[session.playerId] : null;
+
 
   const scopeOpts = { all: {}, tournaments: { includeMatches: false }, matches: { includeTournaments: false } };
   const shareRows = scopeOpts[tab] ? buildRating(data, scopeOpts[tab]) : [];
@@ -425,6 +583,10 @@ function App() {
         {(tab === "all" || tab === "tournaments" || tab === "matches") && (
           <>
             <div style={note}>
+              <b>Это статистика, а не рейтинг.</b> Сила соперников здесь не учитывается: тот, кто
+              всегда играл против слабых, окажется выше того, кто играл против сильных. Ранжирование —
+              на вкладке <b>PC Rating</b>.
+              <br /><br />
               <b>Как считается.</b> Доля очков, которую игрок забрал в своих матчах: набранные очки,
               делённые на все разыгранные. В матче 16:8 оба игрока выигравшей пары получают 16 из 24 —
               66,7%. Количество матчей на показатель не влияет. При менее чем {MIN_GAMES_RELIABLE} играх
@@ -451,7 +613,7 @@ function App() {
               ))}
             </div>
             {sub === "pcr"
-              ? <PcrTable rows={computePCR(data)} playersById={playersById} />
+              ? <PcrTable rows={pcrRows} playersById={playersById} />
               : <QuestionnaireForm me={me} players={players} isAdmin={isAdmin} onSaved={load} />}
           </>
         )}
