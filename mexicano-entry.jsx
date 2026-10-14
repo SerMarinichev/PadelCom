@@ -265,23 +265,30 @@ function StandingsTable({ tournament, standings, playersById }) {
 // ============================================================================
 // One round
 // ============================================================================
-function RoundCard({ round, roundIndex, playersById, pointsPerMatch, onScore, canEnter, canEditSaved }) {
+function RoundCard({ round, roundIndex, savedMatches, playersById, pointsPerMatch, onScore, canEnter, canEditSaved }) {
   const nameOf = (id) => (playersById[id] ? fullName(playersById[id]) : "—");
   return (
     <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 14, marginBottom: 12 }}>
       <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Раунд {roundIndex + 1}</div>
       {round.matches.map((m, mi) => {
-        const saved = m.score1 !== null && m.score1 !== undefined && m.score2 !== null && m.score2 !== undefined;
-        // Entering a result the first time is part of running the tournament.
-        // Changing one that's already recorded is a correction, and corrections
-        // are an admin action — otherwise anyone could quietly rewrite history.
+        const filled = m.score1 !== null && m.score1 !== undefined && m.score2 !== null && m.score2 !== undefined;
+        // «Записан» — это то, что лежит на сервере, а не то, что набрано в полях
+        // прямо сейчас. Раньше признак считался по текущему состоянию, и поле
+        // блокировалось прямо во время набора: ввод первой цифры «1» запускал
+        // автоподстановку второй ячейки, матч тут же выглядел записанным, и
+        // дописать «6» к «16» было уже нельзя. Теперь блокировка наступает
+        // только после нажатия «Сохранить счёт».
+        const sm = savedMatches[mi];
+        const saved = !!sm && sm.score1 !== null && sm.score1 !== undefined && sm.score2 !== null && sm.score2 !== undefined;
+        // Внести результат впервые — часть ведения турнира. Исправить уже
+        // записанный — действие админа, иначе историю можно переписать тихо.
         const editable = saved ? canEditSaved : canEnter;
         return (
           <div key={mi} style={{ borderTop: mi === 0 ? "none" : `1px solid ${C.rule}`, paddingTop: mi === 0 ? 0 : 10, marginTop: mi === 0 ? 0 : 10 }}>
             <div style={{ fontSize: 10.5, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Корт {m.court}</div>
             {[["team1", "score1", "score2", "seeds1"], ["team2", "score2", "score1", "seeds2"]].map(([team, fld, other, seedKey]) => (
               <div key={fld} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: fld === "score1" ? 6 : 0 }}>
-                <span style={{ flex: 1, fontSize: 13.5, fontWeight: saved && Number(m[fld]) > Number(m[other]) ? 700 : 400, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                <span style={{ flex: 1, fontSize: 13.5, fontWeight: filled && Number(m[fld]) > Number(m[other]) ? 700 : 400, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
                   {(m[team] || []).map((pid, k) => {
                     const seed = m[seedKey] ? m[seedKey][k] : null;
                     return (
@@ -462,6 +469,7 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmi
 
       {local.rounds.map((r, i) => (
         <RoundCard key={i} round={r} roundIndex={i} playersById={playersById}
+          savedMatches={((tournament.rounds || [])[i] || {}).matches || []}
           pointsPerMatch={local.pointsPerMatch} onScore={onScore}
           canEnter={canEdit && !local.finished} canEditSaved={isAdmin} />
       ))}
@@ -491,7 +499,8 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmi
 
       {canEdit && !isAdmin && (
         <div style={{ fontSize: 11.5, color: C.slateFaint, marginBottom: 24, lineHeight: 1.45 }}>
-          Исправление уже записанного счёта и удаление турнира доступны только в админ-панели.
+          Пока счёт не сохранён, его можно свободно править. После нажатия «Сохранить счёт»
+          исправление записанного результата и удаление турнира доступны только в админ-панели.
         </div>
       )}
 
