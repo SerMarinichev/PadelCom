@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { buildRating, explainRow, MIN_GAMES_RELIABLE } from "./rating.js";
 import {
   QUESTIONNAIRE, scoreQuestionnaire, computePCR, weeklySeries, ntrpRows,
-  recentChange, headToHead, ratedRows, calibrationReport,
+  recentChange, idleDays, PERIODS, headToHead, ratedRows, calibrationReport,
   MIN_RATED_GAMES, INITIAL_WEIGHT, SCALE_MAX, ELO_BASE,
 } from "./pcr.js";
 
@@ -234,12 +234,13 @@ function ContributionList({ row, playersById, limit = 8 }) {
   );
 }
 
-function PcrRow({ r, i, playersById, rows, provisional, refDate }) {
+function PcrRow({ r, i, playersById, rows, provisional, refDate, period }) {
   const [open, setOpen] = useState(false);
   const p = playersById[r.id];
   const series = open ? weeklySeries(r) : [];
   const h2h = open ? headToHead(rows, r.id) : { partners: [], opponents: [] };
-  const recent = recentChange(r, 30, refDate);
+  const recent = recentChange(r, period.days, refDate);
+  const idle = idleDays(r, refDate);
   return (
     <div>
       <div onClick={() => setOpen((o) => !o)} style={{ display: "flex", alignItems: "center", padding: "10px 13px", borderTop: `1px solid ${C.rule}`, cursor: "pointer", background: i === 0 && !provisional ? "#F7F5FD" : C.card }}>
@@ -251,10 +252,19 @@ function PcrRow({ r, i, playersById, rows, provisional, refDate }) {
           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p ? fullName(p) : r.id}</span>
         </span>
         <span style={{ width: 56, textAlign: "right", fontFamily: FM, fontWeight: 700, fontSize: 15, color: provisional ? C.slateFaint : C.violet }}>{r.elo}</span>
-        <span style={{ width: 52, textAlign: "right", fontFamily: FM, fontSize: 12 }}>
-          {recent && recent.delta !== 0
-            ? <span style={{ color: recent.delta > 0 ? C.positive : C.negative }}>{recent.delta > 0 ? "▲" : "▼"}{Math.abs(recent.delta)}</span>
-            : <span style={{ color: C.slateFaint }}>—</span>}
+        <span style={{ width: 56, textAlign: "right", fontFamily: FM, fontSize: 12 }}>
+          {recent && recent.delta !== 0 && (
+            <span style={{ color: recent.delta > 0 ? C.positive : C.negative }}>{recent.delta > 0 ? "▲" : "▼"}{Math.abs(recent.delta)}</span>
+          )}
+          {recent && recent.delta === 0 && !recent.idle && <span style={{ color: C.slateFaint }}>0</span>}
+          {/* Простой — это не падение рейтинга, а отсутствие данных за период.
+              Показываем срок простоя, как FIDE отметку «inactive», а не минус. */}
+          {recent && recent.idle && (
+            <span title={idle != null ? `Нет игр ${idle} дн.` : "Нет игр в этом периоде"}
+              style={{ color: C.slateFaint, fontSize: 11 }}>
+              {idle != null && idle < 1000 ? `·${idle}д` : "—"}
+            </span>
+          )}
         </span>
         <span style={{ width: 44, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slate }}>{r.rating.toFixed(1)}</span>
         <span style={{ width: 38, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slateFaint }}>{r.games}</span>
@@ -267,6 +277,14 @@ function PcrRow({ r, i, playersById, rows, provisional, refDate }) {
             {r.change !== 0 && <> · {r.change > 0 ? "рост" : "снижение"} на {Math.abs(r.change)} очков</>}
             <br />
             Сыграно {r.games} — {r.wins} побед, {r.losses} поражений, доля очков {r.pointShare != null ? Math.round(r.pointShare * 100) + "%" : "—"} · надёжность {Math.round(r.reliability * 100)}%
+            {recent && recent.idle && (
+              <><br /><span style={{ color: C.slateFaint }}>
+                За период «{period.label.toLowerCase()}» игр нет — рейтинг не менялся.
+                {idle != null && ` Последняя игра ${r.lastPlayed}, это ${idle} дн. назад.`}
+                {" "}Простой не отнимает очков: он снижает надёжность оценки, и первые матчи
+                после возвращения двигают рейтинг сильнее.
+              </span></>
+            )}
             {provisional && <><br /><span style={{ color: C.rust }}>В зачёт не идёт: нужно минимум {MIN_RATED_GAMES} матча.</span></>}
           </div>
           <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Динамика по неделям</div>
@@ -282,22 +300,47 @@ function PcrRow({ r, i, playersById, rows, provisional, refDate }) {
   );
 }
 
+// Подпись колонки короче кнопки: «НЕДЕЛЯ» в 52px наезжает на «РЕЙТИНГ».
+const SHORT = { day: "ДЕНЬ", week: "7 ДН.", month: "30 ДН." };
+
 function PcrTable({ rows, playersById }) {
   const [showCalibration, setShowCalibration] = useState(false);
+  const [periodKey, setPeriodKey] = useState("month");
   if (!rows.length) return <div style={{ ...panel, padding: 24, textAlign: "center", fontSize: 13.5, color: C.slateFaint, border: `1px dashed ${C.rule}` }}>Нет игроков.</div>;
   const rated = rows.filter((r) => r.rated);
   const provisional = rows.filter((r) => !r.rated && r.games > 0);
   const untouched = rows.filter((r) => r.games === 0);
   // Окно динамики отсчитывается от последней сыгранной игры, а не от сегодня.
   const refDate = rows.lastGameDate ? new Date(rows.lastGameDate) : new Date();
+  const period = PERIODS.find((p) => p.key === periodKey) || PERIODS[PERIODS.length - 1];
+  const movers = rated.filter((r) => {
+    const rc = recentChange(r, period.days, refDate);
+    return rc && !rc.idle;
+  }).length;
 
   const head = (
     <div style={headRow}>
       <span style={{ width: 26 }}>#</span><span style={{ flex: 1 }}>Игрок</span>
       <span style={{ width: 56, textAlign: "right" }}>Рейтинг</span>
-      <span style={{ width: 52, textAlign: "right" }}>30 дн.</span>
+      <span style={{ width: 56, textAlign: "right" }}>{SHORT[period.key]}</span>
       <span style={{ width: 44, textAlign: "right" }}>Ур.</span>
       <span style={{ width: 38, textAlign: "right" }}>Игр</span>
+    </div>
+  );
+
+  const periodPicker = (
+    <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+      <span style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginRight: 2 }}>Динамика за</span>
+      {PERIODS.map((p) => (
+        <button key={p.key} onClick={() => setPeriodKey(p.key)} style={{
+          fontSize: 12.5, fontWeight: 600, padding: "5px 12px", borderRadius: 8, cursor: "pointer",
+          background: p.key === periodKey ? C.violet : C.card, color: p.key === periodKey ? "#fff" : C.ink,
+          border: `1px solid ${p.key === periodKey ? C.violet : C.rule}`,
+        }}>{p.label}</button>
+      ))}
+      <span style={{ fontSize: 11.5, color: C.slateFaint, marginLeft: "auto" }}>
+        играли {movers} из {rated.length}
+      </span>
     </div>
   );
 
@@ -309,16 +352,25 @@ function PcrTable({ rows, playersById }) {
         матча обе стороны сдвигаются на столько, насколько результат разошёлся с ожидаемым. Чем
         крупнее разрыв в счёте, тем сильнее сдвиг; матч до 32 весит больше, чем до 12.
         Вся история пересчитывается заново при каждом обновлении, поэтому порядок матчей на итог
-        не влияет. Колонка <b>30 дн.</b> — движение за 30 дней до последней сыгранной
-        в сообществе игры{rows.lastGameDate ? ` (${rows.lastGameDate})` : ""}; у тех, кто в этот
-        месяц не играл, стоит прочерк.
+        не влияет.
+        <br /><br />
+        <b>Динамика.</b> Период переключается кнопками ниже: день, неделя или 30 дней. Окно
+        отсчитывается от последней сыгранной в сообществе игры
+        {rows.lastGameDate ? ` (${rows.lastGameDate})` : ""}, а не от сегодняшнего числа —
+        иначе между сессиями все колонки были бы пустыми. «День» — это последний игровой день.
+        У того, кто в выбранном периоде не играл, вместо стрелки стоит срок простоя
+        (например, <span style={{ fontFamily: FM }}>·14д</span>): рейтинг за это время не менялся,
+        потому что меняют его только сыгранные матчи. Простой не отнимает очков — он снижает
+        надёжность оценки.
         Игроки менее {MIN_RATED_GAMES} матчей в зачёт не идут.
         Нажмите на строку, чтобы увидеть динамику, встречи и вклад каждого матча.
       </div>
 
+      {periodPicker}
+
       <div style={panel}>
         {head}
-        {rated.map((r, i) => <PcrRow key={r.id} r={r} i={i} playersById={playersById} rows={rows} refDate={refDate} />)}
+        {rated.map((r, i) => <PcrRow key={r.id} r={r} i={i} playersById={playersById} rows={rows} refDate={refDate} period={period} />)}
       </div>
 
       {provisional.length > 0 && (
@@ -328,7 +380,7 @@ function PcrTable({ rows, playersById }) {
           </div>
           <div style={panel}>
             {head}
-            {provisional.map((r, i) => <PcrRow key={r.id} r={r} i={i} playersById={playersById} rows={rows} refDate={refDate} provisional />)}
+            {provisional.map((r, i) => <PcrRow key={r.id} r={r} i={i} playersById={playersById} rows={rows} refDate={refDate} period={period} provisional />)}
           </div>
         </>
       )}

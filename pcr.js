@@ -467,6 +467,7 @@ export function computePCR(data, opts = {}) {
       losses: n - wins,
       pointsFor, pointsAgainst,
       pointShare: pointsFor + pointsAgainst ? r2(pointsFor / (pointsFor + pointsAgainst)) : null,
+      lastPlayed: n ? list[n - 1].game.date : null,
       history: list,
     };
   });
@@ -537,7 +538,31 @@ export function weeklySeries(row) {
     }));
 }
 
+// Периоды, за которые показывается движение рейтинга.
+export const PERIODS = [
+  { key: "day", days: 1, label: "День", full: "последний игровой день" },
+  { key: "week", days: 7, label: "Неделя", full: "последние 7 дней" },
+  { key: "month", days: 30, label: "30 дней", full: "последние 30 дней" },
+];
+
 // Сдвиг за последние N дней — то, что показывается стрелкой в таблице.
+//
+// Для того, кто в этом окне не играл, возвращается delta: 0 и games: 0 —
+// и это не заглушка, а содержательный ответ. PC Rating принадлежит к семейству
+// систем-ОЦЕНОК (Elo, Glicko, Glicko-2, TrueSkill, UTR): рейтинг там меняется
+// ТОЛЬКО по результатам сыгранных матчей, а простой не отнимает очков. В Glicko
+// во время простоя растёт не рейтинг, а неопределённость RD — это у нас
+// реализовано в runPass через RD_DRIFT_PER_WEEK.
+//
+// Противоположный подход — системы РЕЙТИНГОВЫХ ОЧКОВ (ATP/WTA, FIP, OWGR):
+// там очки начисляются за турниры и «сгорают» через 52 недели, поэтому
+// пропуск механически опускает позицию. Этот подход меряет не силу игрока,
+// а активность и результативность за период, и для сообщества, где люди
+// пропускают месяц без потери навыка, он даёт неверную картину.
+//
+// Поэтому сюда decay не добавляется. Вместо него интерфейс показывает срок
+// простоя и падающую надёжность — то же, что делает FIDE отметкой «inactive»
+// и UTR снижением reliability.
 export function recentChange(row, days = 30, now = new Date()) {
   if (!row || !row.history || !row.history.length) return null;
   const ref = now instanceof Date ? now : new Date(now);
@@ -547,11 +572,21 @@ export function recentChange(row, days = 30, now = new Date()) {
     const d = new Date(h.game.date);
     return !isNaN(d) && d >= cutoff;
   });
-  if (!inWindow.length) return { delta: 0, games: 0 };
+  if (!inWindow.length) return { delta: 0, games: 0, idle: true };
   return {
     delta: Math.round(inWindow[inWindow.length - 1].elo - inWindow[0].before),
     games: inWindow.length,
+    idle: false,
   };
+}
+
+// Сколько дней прошло с последней игры игрока к опорной дате.
+export function idleDays(row, now = new Date()) {
+  if (!row || !row.lastPlayed) return null;
+  const ref = now instanceof Date ? now : new Date(now);
+  const last = new Date(row.lastPlayed);
+  if (isNaN(ref) || isNaN(last)) return null;
+  return Math.max(0, Math.round((ref - last) / 86400000));
 }
 
 // Личные встречи: с кем играл в паре и против кого, с каким результатом.
