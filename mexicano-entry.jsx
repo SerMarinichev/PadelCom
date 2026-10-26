@@ -89,6 +89,8 @@ function CreateForm({ players, teams, venues, onCreate, onCancel, busy }) {
   const [touchedRounds, setTouchedRounds] = useState(false);
   const [teamId, setTeamId] = useState("");
   const [venueId, setVenueId] = useState("");
+  const [manual, setManual] = useState(false);
+  const [startTime, setStartTime] = useState("");
 
   const toggle = (id) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
   // A team is a roster filter over the general player list, nothing more: the
@@ -122,6 +124,14 @@ function CreateForm({ players, teams, venues, onCreate, onCancel, busy }) {
     <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
       <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 16, marginBottom: 14 }}>Новый турнир</div>
 
+      {/* Турнир задним числом: составы раундов вводятся вручную, поэтому
+          рекомендация по числу раундов и схема посева здесь ни на что не влияют. */}
+      <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, cursor: "pointer", fontSize: 13 }}>
+        <input type="checkbox" checked={manual} onChange={(e) => setManual(e.target.checked)}
+          style={{ width: 17, height: 17, accentColor: C.action }} />
+        <span>Турнир задним числом — раунды заполню вручную</span>
+      </label>
+
       <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
         {[FORMATS.MEXICANO, FORMATS.AMERICANO].map((f) => (
           <button key={f} onClick={() => { setFormat(f); setTouchedRounds(false); }} style={{
@@ -142,9 +152,13 @@ function CreateForm({ players, teams, venues, onCreate, onCancel, busy }) {
           <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Название</div>
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder={FORMAT_LABEL[format]} style={{ ...inputStyle, width: "100%" }} />
         </div>
-        <div style={{ flex: "0 0 155px" }}>
+        <div style={{ flex: "0 0 150px" }}>
           <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Дата</div>
           <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={{ ...inputStyle, width: "100%" }} />
+        </div>
+        <div style={{ flex: "0 0 110px" }}>
+          <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Время</div>
+          <input type="time" value={startTime} onChange={(e) => setStartTime(e.target.value)} style={{ ...inputStyle, width: "100%" }} />
         </div>
         <div style={{ flex: "1 1 200px" }}>
           <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Объект</div>
@@ -236,8 +250,8 @@ function CreateForm({ players, teams, venues, onCreate, onCancel, busy }) {
 
       <div style={{ display: "flex", gap: 8 }}>
         <button disabled={!enough || busy}
-          onClick={() => onCreate({ format, name: name.trim() || FORMAT_LABEL[format], date, venueId: venueId || null, pointsPerMatch, courts, seeding, playerIds: selected, targetRounds: roundsNum || null })}
-          style={{ ...btn(C.court), opacity: !enough || busy ? 0.45 : 1 }}>Создать турнир</button>
+          onClick={() => onCreate({ format, name: name.trim() || FORMAT_LABEL[format], date, startTime: startTime || null, venueId: venueId || null, manual, pointsPerMatch, courts, seeding, playerIds: selected, targetRounds: roundsNum || null })}
+          style={{ ...btn(C.court), opacity: !enough || busy ? 0.45 : 1 }}>{manual ? "Создать и заполнить" : "Создать турнир"}</button>
         <button onClick={onCancel} style={{ ...btn("none", C.slateFaint), border: `1px solid ${C.rule}` }}>Отмена</button>
       </div>
     </div>
@@ -305,8 +319,11 @@ function RoundCard({ round, roundIndex, savedMatches, playersById, pointsPerMatc
     <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 14, marginBottom: 12 }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10 }}>
         <span style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 14 }}>Раунд {roundIndex + 1}</span>
+        {round.manual && (
+          <span style={{ fontSize: 10.5, color: C.action, border: `1px solid ${C.action}`, borderRadius: 999, padding: "0 7px" }}>вручную</span>
+        )}
         {fmtDateTime(round.createdAt) && (
-          <span style={{ fontSize: 11, color: C.slateFaint }}>сформирован {fmtDateTime(round.createdAt)}</span>
+          <span style={{ fontSize: 11, color: C.slateFaint }}>{round.manual ? "внесён" : "сформирован"} {fmtDateTime(round.createdAt)}</span>
         )}
       </div>
       {round.matches.map((m, mi) => {
@@ -376,6 +393,126 @@ function RoundCard({ round, roundIndex, savedMatches, playersById, pointsPerMatc
 }
 
 // ============================================================================
+// Ручной ввод раунда — для турниров, заносимых задним числом
+// ============================================================================
+// Жеребьёвка здесь не участвует: состав каждого матча известен заранее, его
+// надо просто записать. Поэтому вместо алгоритма — четыре выпадающих списка на
+// корт и поля счёта. Кто не попал ни в один матч, автоматически считается
+// отдыхавшим: отдельно отмечать их не нужно, а забыть — нельзя.
+function ManualRoundEditor({ tournament, players, playersById, onSave, onCancel, busy }) {
+  const active = activePlayerIds(tournament);
+  const activePlayers = players.filter((p) => active.includes(p.id));
+  const emptyMatch = () => ({ a1: "", a2: "", b1: "", b2: "", score1: "", score2: "" });
+  const [matches, setMatches] = useState(
+    Array.from({ length: Math.max(1, Math.min(Number(tournament.courts) || 1, Math.floor(active.length / 4) || 1)) }, emptyMatch)
+  );
+
+  const setField = (mi, field, value) => setMatches((ms) => ms.map((m, i) => (i === mi ? { ...m, [field]: value } : m)));
+
+  const used = [];
+  matches.forEach((m) => ["a1", "a2", "b1", "b2"].forEach((k) => { if (m[k]) used.push(m[k]); }));
+  const duplicates = used.filter((id, i) => used.indexOf(id) !== i);
+  const sitting = active.filter((id) => !used.includes(id));
+
+  const problems = [];
+  matches.forEach((m, i) => {
+    const slots = [m.a1, m.a2, m.b1, m.b2].filter(Boolean);
+    if (slots.length && slots.length < 4) problems.push(`Корт ${i + 1}: заполнены не все четыре игрока`);
+    const s1 = m.score1 === "" ? null : Number(m.score1);
+    const s2 = m.score2 === "" ? null : Number(m.score2);
+    if (slots.length === 4 && (s1 === null || s2 === null)) problems.push(`Корт ${i + 1}: не внесён счёт`);
+    if ((s1 !== null && s1 < 0) || (s2 !== null && s2 < 0)) problems.push(`Корт ${i + 1}: счёт не может быть отрицательным`);
+  });
+  if (duplicates.length) {
+    const names = [...new Set(duplicates)].map((id) => (playersById[id] ? fullName(playersById[id]) : id));
+    problems.push(`Один игрок в нескольких матчах: ${names.join(", ")}`);
+  }
+  const filled = matches.filter((m) => [m.a1, m.a2, m.b1, m.b2].every(Boolean));
+  if (!filled.length) problems.push("Нужен хотя бы один заполненный матч");
+
+  const save = () => {
+    const round = {
+      manual: true,
+      sitting,
+      matches: filled.map((m, i) => ({
+        court: i + 1,
+        team1: [m.a1, m.a2], team2: [m.b1, m.b2],
+        score1: Number(m.score1), score2: Number(m.score2),
+      })),
+    };
+    onSave(round);
+  };
+
+  const slot = (mi, field, label) => (
+    <select value={matches[mi][field]} onChange={(e) => setField(mi, field, e.target.value)}
+      style={{ ...inputStyle, width: "100%", fontSize: 13.5 }}>
+      <option value="">{label}</option>
+      {activePlayers.map((p) => <option key={p.id} value={p.id}>{fullName(p)}</option>)}
+    </select>
+  );
+
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.action}`, borderRadius: 12, padding: 14, marginBottom: 12 }}>
+      <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 15, marginBottom: 4 }}>
+        Раунд {(tournament.rounds || []).length + 1} — ручной ввод
+      </div>
+      <div style={{ fontSize: 11.5, color: C.slateFaint, marginBottom: 12 }}>
+        Укажите составы и счёт. Остальные попадут в отдыхающие автоматически.
+      </div>
+
+      {matches.map((m, mi) => (
+        <div key={mi} style={{ borderTop: mi ? `1px solid ${C.rule}` : "none", paddingTop: mi ? 12 : 0, marginTop: mi ? 12 : 0 }}>
+          <div style={{ display: "flex", alignItems: "center", marginBottom: 6 }}>
+            <span style={{ fontSize: 10.5, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em" }}>Корт {mi + 1}</span>
+            {matches.length > 1 && (
+              <button onClick={() => setMatches((ms) => ms.filter((_, i) => i !== mi))}
+                style={{ marginLeft: "auto", fontSize: 11.5, background: "none", border: "none", color: C.negative, cursor: "pointer" }}>убрать корт</button>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+              {slot(mi, "a1", "Игрок 1")}
+              {slot(mi, "a2", "Игрок 2")}
+            </div>
+            <input type="number" min="0" value={m.score1} onChange={(e) => setField(mi, "score1", e.target.value)}
+              placeholder="0" style={{ ...inputStyle, width: 58, textAlign: "center", fontFamily: FONT_MONO }} />
+          </div>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+              {slot(mi, "b1", "Игрок 3")}
+              {slot(mi, "b2", "Игрок 4")}
+            </div>
+            <input type="number" min="0" value={m.score2} onChange={(e) => setField(mi, "score2", e.target.value)}
+              placeholder="0" style={{ ...inputStyle, width: 58, textAlign: "center", fontFamily: FONT_MONO }} />
+          </div>
+        </div>
+      ))}
+
+      <button onClick={() => setMatches((ms) => [...ms, emptyMatch()])}
+        style={{ ...btn("none", C.action), border: `1px dashed ${C.rule}`, marginTop: 12, fontSize: 12.5, padding: "7px 12px" }}>
+        + Ещё корт
+      </button>
+
+      <div style={{ fontSize: 12, color: C.slateFaint, marginTop: 12, lineHeight: 1.5 }}>
+        Отдыхают: {sitting.length ? sitting.map((id) => (playersById[id] ? fullName(playersById[id]) : id)).join(", ") : "никто"}
+      </div>
+
+      {problems.length > 0 && (
+        <div style={{ fontSize: 12, color: C.rust, marginTop: 10, lineHeight: 1.5 }}>
+          {problems.map((t, i) => <div key={i}>· {t}</div>)}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+        <button disabled={problems.length > 0 || busy} onClick={save}
+          style={{ ...btn(C.court), opacity: problems.length > 0 || busy ? 0.45 : 1 }}>Сохранить раунд</button>
+        <button onClick={onCancel} style={{ ...btn("none", C.slateFaint), border: `1px solid ${C.rule}` }}>Отмена</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // Tournament view
 // ============================================================================
 function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit, isAdmin, levels }) {
@@ -384,6 +521,7 @@ function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit
   const [msg, setMsg] = useState("");
   const [withdrawFor, setWithdrawFor] = useState(null);
   const [adding, setAdding] = useState(false);
+  const [manualRound, setManualRound] = useState(false);
   const [addSearch, setAddSearch] = useState("");
   const [withdrawReason, setWithdrawReason] = useState("Травма");
 
@@ -444,6 +582,13 @@ function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit
     })) });
   };
 
+  // Ручной раунд сохраняется тем же путём, что и сформированный жеребьёвкой —
+  // отличается только происхождением состава.
+  const addManualRound = (round) => {
+    setManualRound(false);
+    persist({ ...local, rounds: [...local.rounds, round] });
+  };
+
   const nextRound = () => {
     const round = buildRound(local, playersById, computeStandings(local), levels);
     persist({ ...local, rounds: [...local.rounds, round] });
@@ -489,7 +634,7 @@ function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit
         {local.finished && <span style={{ fontSize: 11, color: C.court, border: `1px solid ${C.court}`, borderRadius: 999, padding: "2px 9px" }}>завершён</span>}
       </div>
       <div style={{ fontSize: 12, color: C.slateFaint, marginBottom: 16, fontFamily: FONT_MONO }}>
-        {local.date} · до {local.pointsPerMatch} · кортов {local.courts} · {active.length} в игре
+        {local.date}{local.startTime ? `, ${local.startTime}` : ""} · до {local.pointsPerMatch} · кортов {local.courts} · {active.length} в игре
         {local.targetRounds ? ` · раунд ${local.rounds.length}/${local.targetRounds}` : ` · раундов ${local.rounds.length}`}
       </div>
 
@@ -513,7 +658,8 @@ function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit
         </div>
 
         <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.rule}`, fontSize: 11.5, color: C.slateFaint, lineHeight: 1.6 }}>
-          {createdAtText && <div>Турнир создан: {createdAtText}</div>}
+          {local.manual && <div style={{ color: C.action }}>Внесён задним числом — раунды заполнены вручную</div>}
+          {createdAtText && <div>{local.manual ? "Запись создана" : "Турнир создан"}: {createdAtText}</div>}
           {firstScoreText && <div>Первый результат внесён: {firstScoreText}</div>}
           {lastScoreText && <div>Последний результат внесён: {lastScoreText}</div>}
           <div>Результатов внесено: {scoredCount} из {totalMatches}</div>
@@ -614,7 +760,9 @@ function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit
 
       {local.rounds.length === 0 && (
         <div style={{ background: C.card, border: `1px dashed ${C.rule}`, borderRadius: 12, padding: 22, textAlign: "center", fontSize: 13.5, color: C.slateFaint, marginBottom: 12 }}>
-          Турнир создан. Нажмите «Сформировать раунд» для первой жеребьёвки.
+          {local.manual
+            ? "Раундов пока нет. Нажмите «Раунд вручную» и внесите составы и счёт."
+            : "Турнир создан. Нажмите «Сформировать раунд» для первой жеребьёвки."}
         </div>
       )}
 
@@ -625,6 +773,11 @@ function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit
           canEnter={canEdit && !local.finished} canEditSaved={isAdmin} />
       ))}
 
+      {manualRound && (
+        <ManualRoundEditor tournament={local} players={players} playersById={playersById}
+          onSave={addManualRound} onCancel={() => setManualRound(false)} busy={busy} />
+      )}
+
       {msg && <div style={{ fontSize: 12.5, color: C.negative, marginBottom: 10 }}>{msg}</div>}
 
       {canEdit && (
@@ -632,6 +785,13 @@ function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit
           {local.rounds.length > 0 && (
             <button onClick={() => persist(local)} disabled={busy} style={{ ...btn(C.action), opacity: busy ? 0.5 : 1 }}>
               {busy ? "Сохранение…" : "Сохранить счёт"}
+            </button>
+          )}
+          {!local.finished && isAdmin && (
+            <button onClick={() => setManualRound(true)} disabled={busy || manualRound}
+              title="Самостоятельно указать составы и счёт — для турниров, вносимых задним числом"
+              style={{ ...btn("none", C.action), border: `1px solid ${C.action}`, opacity: busy || manualRound ? 0.45 : 1 }}>
+              + Раунд вручную
             </button>
           )}
           {!local.finished && (

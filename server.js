@@ -102,6 +102,17 @@ function todayISOServer() {
 // часы на телефоне организатора могут отставать на часы, а «зафиксировано в
 // 19:42» имеет смысл только тогда, когда это время проставил не тот, кто вносит
 // данные. Отображается уже в местном поясе.
+// Время начала турнира в виде ЧЧ:ММ. Нужно для турниров, которые заносят
+// задним числом: дата у них своя, а время игры иначе потерялось бы.
+function normalizeStartTime(v) {
+  if (typeof v !== "string") return null;
+  const m = v.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = Number(m[1]), min = Number(m[2]);
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
+
 function nowISOServer() {
   return new Date().toISOString();
 }
@@ -1361,6 +1372,11 @@ async function processTelegramUpdate(update, data) {
           format: body.format === "americano" ? "americano" : "mexicano",
           seeding: body.seeding === "1+3" ? "1+3" : "1+4",
           venueId: typeof body.venueId === "string" && body.venueId ? body.venueId : null,
+          startTime: normalizeStartTime(body.startTime),
+          // Турнир, заносимый задним числом: раунды в нём составляются вручную,
+          // а не жеребьёвкой. Отдельный признак нужен, чтобы интерфейс не
+          // предлагал сформировать раунд алгоритмом там, где состав уже известен.
+          manual: body.manual === true,
           targetRounds: Number(body.targetRounds) > 0 ? Number(body.targetRounds) : null,
           playerIds: Array.isArray(body.playerIds) ? body.playerIds : [],
           withdrawals: [],
@@ -1409,11 +1425,15 @@ async function processTelegramUpdate(update, data) {
                 };
               })
             : (t.joins || []);
+          const startTime = body.startTime === undefined
+            ? (t.startTime || null)
+            : normalizeStartTime(body.startTime);
           const venueId = body.venueId === undefined
             ? (t.venueId || null)
             : (typeof body.venueId === "string" && body.venueId ? body.venueId : null);
           const next = {
-            ...t, ...body, rounds, venueId, joins,
+            ...t, ...body, rounds, venueId, joins, startTime,
+            manual: body.manual === undefined ? (t.manual === true) : body.manual === true,
             id: t.id, createdAt: t.createdAt, createdBy: t.createdBy || null,
             updatedAt: nowISOServer(), updatedBy: editor,
           };
