@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 import {
   FORMATS, buildRound, computeStandings, sortedStandings, buildHistory,
-  activePlayerIds, recommendedRounds, restIsEven, playingCount,
+  activePlayerIds, recommendedRounds, restIsEven, playingCount, joinBaselineSitOuts,
 } from "./engine.js";
 import { computePCR } from "./pcr.js";
 
@@ -19,6 +19,25 @@ const FONT_MONO = "'IBM Plex Mono', ui-monospace, monospace";
 
 const fullName = (p) => [p.firstName, p.lastName].filter(Boolean).join(" ").trim() || "Без имени";
 const FORMAT_LABEL = { [FORMATS.MEXICANO]: "Mexicano", [FORMATS.AMERICANO]: "Americano" };
+
+// Отметки времени приходят с сервера в UTC — показываем в ташкентском поясе,
+// иначе вечерний турнир выглядел бы сыгранным днём.
+const TZ = "Asia/Tashkent";
+const fmtDateTime = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d)) return null;
+  return d.toLocaleString("ru-RU", {
+    timeZone: TZ, day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+};
+const fmtTime = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d)) return null;
+  return d.toLocaleTimeString("ru-RU", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+};
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -58,7 +77,7 @@ function Avatar({ player, size = 26, dim }) {
 // ============================================================================
 // Create form
 // ============================================================================
-function CreateForm({ players, teams, onCreate, onCancel, busy }) {
+function CreateForm({ players, teams, venues, onCreate, onCancel, busy }) {
   const [format, setFormat] = useState(FORMATS.MEXICANO);
   const [name, setName] = useState("");
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
@@ -69,6 +88,7 @@ function CreateForm({ players, teams, onCreate, onCancel, busy }) {
   const [targetRounds, setTargetRounds] = useState("");
   const [touchedRounds, setTouchedRounds] = useState(false);
   const [teamId, setTeamId] = useState("");
+  const [venueId, setVenueId] = useState("");
 
   const toggle = (id) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
   // A team is a roster filter over the general player list, nothing more: the
@@ -125,6 +145,13 @@ function CreateForm({ players, teams, onCreate, onCancel, busy }) {
         <div style={{ flex: "0 0 155px" }}>
           <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Дата</div>
           <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={{ ...inputStyle, width: "100%" }} />
+        </div>
+        <div style={{ flex: "1 1 200px" }}>
+          <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Объект</div>
+          <select value={venueId} onChange={(e) => setVenueId(e.target.value)} style={{ ...inputStyle, width: "100%" }}>
+            <option value="">Не указан</option>
+            {venues.map((v) => <option key={v.id} value={v.id}>{v.name || "Без названия"}</option>)}
+          </select>
         </div>
       </div>
 
@@ -209,7 +236,7 @@ function CreateForm({ players, teams, onCreate, onCancel, busy }) {
 
       <div style={{ display: "flex", gap: 8 }}>
         <button disabled={!enough || busy}
-          onClick={() => onCreate({ format, name: name.trim() || FORMAT_LABEL[format], date, pointsPerMatch, courts, seeding, playerIds: selected, targetRounds: roundsNum || null })}
+          onClick={() => onCreate({ format, name: name.trim() || FORMAT_LABEL[format], date, venueId: venueId || null, pointsPerMatch, courts, seeding, playerIds: selected, targetRounds: roundsNum || null })}
           style={{ ...btn(C.court), opacity: !enough || busy ? 0.45 : 1 }}>Создать турнир</button>
         <button onClick={onCancel} style={{ ...btn("none", C.slateFaint), border: `1px solid ${C.rule}` }}>Отмена</button>
       </div>
@@ -225,6 +252,8 @@ function StandingsTable({ tournament, standings, playersById }) {
   const rows = sortedStandings(standings, nameOf);
   const withdrawnIds = new Set((tournament.withdrawals || []).map((w) => w.playerId));
   const reasonOf = (id) => (tournament.withdrawals || []).find((w) => w.playerId === id)?.reason;
+  const joinedAtRound = {};
+  (tournament.joins || []).forEach((j) => { if (j && j.playerId) joinedAtRound[j.playerId] = j.round; });
 
   return (
     <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, overflow: "hidden" }}>
@@ -248,6 +277,11 @@ function StandingsTable({ tournament, standings, playersById }) {
                 {p ? fullName(p) : "—"}
               </span>
               {out && <span title={reasonOf(r.id) || "выбыл"} style={{ fontSize: 10, color: C.rust, border: `1px solid ${C.rust}`, borderRadius: 999, padding: "0 6px", flex: "0 0 auto" }}>выбыл</span>}
+              {!out && joinedAtRound[r.id] !== undefined && joinedAtRound[r.id] > 0 && (
+                <span title={`Вступил в турнир с раунда ${joinedAtRound[r.id] + 1}`} style={{ fontSize: 10, color: C.action, border: `1px solid ${C.action}`, borderRadius: 999, padding: "0 6px", flex: "0 0 auto" }}>
+                  с р.{joinedAtRound[r.id] + 1}
+                </span>
+              )}
             </span>
             <span style={{ width: 50, textAlign: "right", fontFamily: FONT_MONO, fontWeight: 700, fontSize: 14 }}>{r.points}</span>
             <span style={{ width: 44, textAlign: "right", fontFamily: FONT_MONO, fontSize: 12, color: r.points - r.conceded >= 0 ? C.positive : C.negative }}>
@@ -269,7 +303,12 @@ function RoundCard({ round, roundIndex, savedMatches, playersById, pointsPerMatc
   const nameOf = (id) => (playersById[id] ? fullName(playersById[id]) : "—");
   return (
     <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 14, marginBottom: 12 }}>
-      <div style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 14, marginBottom: 10 }}>Раунд {roundIndex + 1}</div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10 }}>
+        <span style={{ fontFamily: FONT_DISPLAY, fontWeight: 700, fontSize: 14 }}>Раунд {roundIndex + 1}</span>
+        {fmtDateTime(round.createdAt) && (
+          <span style={{ fontSize: 11, color: C.slateFaint }}>сформирован {fmtDateTime(round.createdAt)}</span>
+        )}
+      </div>
       {round.matches.map((m, mi) => {
         const filled = m.score1 !== null && m.score1 !== undefined && m.score2 !== null && m.score2 !== undefined;
         // «Записан» — это то, что лежит на сервере, а не то, что набрано в полях
@@ -285,7 +324,15 @@ function RoundCard({ round, roundIndex, savedMatches, playersById, pointsPerMatc
         const editable = saved ? canEditSaved : canEnter;
         return (
           <div key={mi} style={{ borderTop: mi === 0 ? "none" : `1px solid ${C.rule}`, paddingTop: mi === 0 ? 0 : 10, marginTop: mi === 0 ? 0 : 10 }}>
-            <div style={{ fontSize: 10.5, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Корт {m.court}</div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 6 }}>
+              <span style={{ fontSize: 10.5, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em" }}>Корт {m.court}</span>
+              {/* Отметку ставит сервер в момент сохранения, не браузер. */}
+              {saved && fmtTime(sm.scoredAt) && (
+                <span style={{ fontSize: 10.5, color: C.slateFaint, marginLeft: "auto" }} title={fmtDateTime(sm.scoredAt)}>
+                  счёт внесён {fmtTime(sm.scoredAt)}
+                </span>
+              )}
+            </div>
             {[["team1", "score1", "score2", "seeds1"], ["team2", "score2", "score1", "seeds2"]].map(([team, fld, other, seedKey]) => (
               <div key={fld} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: fld === "score1" ? 6 : 0 }}>
                 <span style={{ flex: 1, fontSize: 13.5, fontWeight: filled && Number(m[fld]) > Number(m[other]) ? 700 : 400, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
@@ -331,11 +378,13 @@ function RoundCard({ round, roundIndex, savedMatches, playersById, pointsPerMatc
 // ============================================================================
 // Tournament view
 // ============================================================================
-function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmin, levels }) {
+function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit, isAdmin, levels }) {
   const [local, setLocal] = useState(tournament);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [withdrawFor, setWithdrawFor] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [addSearch, setAddSearch] = useState("");
   const [withdrawReason, setWithdrawReason] = useState("Травма");
 
   useEffect(() => { setLocal(tournament); }, [tournament.id]);
@@ -346,6 +395,23 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmi
   const active = activePlayerIds(local);
   const history = buildHistory(local);
 
+  // В кандидаты идут все, кого в турнире ещё нет. Снятые сюда не попадают —
+  // для них есть кнопка «вернуть» в списке выбывших.
+  const inTournament = new Set(local.playerIds || []);
+  const candidates = players.filter((p) => !inTournament.has(p.id)
+    && (!addSearch.trim() || fullName(p).toLowerCase().includes(addSearch.trim().toLowerCase())));
+
+  const venueName = (venues.find((v) => v.id === local.venueId) || {}).name || "";
+  // Журнал времени строится из серверных отметок на матчах, а не из отдельного
+  // поля: так он не может разойтись с тем, что реально записано в раундах.
+  const allMatches = local.rounds.flatMap((r) => r.matches || []);
+  const totalMatches = allMatches.length;
+  const scoredStamps = allMatches.map((m) => m.scoredAt).filter(Boolean).sort();
+  const scoredCount = allMatches.filter((m) => m.score1 !== null && m.score1 !== undefined && m.score2 !== null && m.score2 !== undefined).length;
+  const createdAtText = fmtDateTime(local.createdAt);
+  const firstScoreText = fmtDateTime(scoredStamps[0]);
+  const lastScoreText = scoredStamps.length > 1 ? fmtDateTime(scoredStamps[scoredStamps.length - 1]) : null;
+
   const lastRound = local.rounds[local.rounds.length - 1];
   const lastComplete = !lastRound || lastRound.matches.every((m) => m.score1 !== null && m.score1 !== undefined && m.score2 !== null && m.score2 !== undefined);
   const reachedTarget = local.targetRounds ? local.rounds.length >= local.targetRounds : false;
@@ -354,8 +420,12 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmi
   const persist = async (next) => {
     setLocal(next); setBusy(true); setMsg("");
     try {
-      await api(`/api/mexicano/${local.id}`, { method: "PUT", body: next });
-      onUpdate(next);
+      const res = await api(`/api/mexicano/${local.id}`, { method: "PUT", body: next });
+      // Сервер возвращает турнир со своими отметками времени — берём его версию,
+      // иначе время внесения счёта появится только после перезагрузки.
+      const applied = (res && res.tournament) || next;
+      setLocal(applied);
+      onUpdate(applied);
     } catch (e) {
       setMsg(e.status === 403 ? "Нужен вход через Telegram или в админ-панель" : `Не сохранилось: ${e.message}`);
     } finally { setBusy(false); }
@@ -377,6 +447,23 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmi
   const nextRound = () => {
     const round = buildRound(local, playersById, computeStandings(local), levels);
     persist({ ...local, rounds: [...local.rounds, round] });
+  };
+
+  // Добавление игрока по ходу турнира. В playerIds он попадает в конец, а в
+  // joins записывается, с какого раунда вступил и с каким базовым уровнем
+  // пропусков — чтобы очередь на отдых не перекосило (см. buildHistory).
+  const doAdd = (playerId) => {
+    const next = {
+      ...local,
+      playerIds: [...(local.playerIds || []), playerId],
+      joins: [...(local.joins || []), {
+        playerId,
+        round: local.rounds.length,
+        baselineSitOuts: joinBaselineSitOuts(local),
+      }],
+    };
+    setAdding(false); setAddSearch("");
+    persist(next);
   };
 
   const doWithdraw = () => {
@@ -406,6 +493,33 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmi
         {local.targetRounds ? ` · раунд ${local.rounds.length}/${local.targetRounds}` : ` · раундов ${local.rounds.length}`}
       </div>
 
+      {/* Объект и журнал времени. Объект меняется и после завершения турнира:
+          его часто вспоминают уже потом, а блокировать правку задним числом
+          здесь нечему — на расчёт рейтинга объект не влияет. */}
+      <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", gap: 10 }}>
+          <div style={{ flex: "1 1 220px" }}>
+            <div style={{ fontSize: 11, color: C.slateFaint, marginBottom: 4 }}>Объект</div>
+            {isAdmin ? (
+              <select value={local.venueId || ""} onChange={(e) => persist({ ...local, venueId: e.target.value || null })}
+                disabled={busy} style={{ ...inputStyle, width: "100%" }}>
+                <option value="">Не указан</option>
+                {venues.map((v) => <option key={v.id} value={v.id}>{v.name || "Без названия"}</option>)}
+              </select>
+            ) : (
+              <div style={{ fontSize: 14 }}>{venueName || <span style={{ color: C.slateFaint }}>не указан</span>}</div>
+            )}
+          </div>
+        </div>
+
+        <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.rule}`, fontSize: 11.5, color: C.slateFaint, lineHeight: 1.6 }}>
+          {createdAtText && <div>Турнир создан: {createdAtText}</div>}
+          {firstScoreText && <div>Первый результат внесён: {firstScoreText}</div>}
+          {lastScoreText && <div>Последний результат внесён: {lastScoreText}</div>}
+          <div>Результатов внесено: {scoredCount} из {totalMatches}</div>
+        </div>
+      </div>
+
       {local.finished && winner && (
         <div style={{ background: "#F6FBF8", border: `1px solid ${C.court}`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
           <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>Победитель</div>
@@ -422,6 +536,43 @@ function TournamentView({ tournament, players, onBack, onUpdate, canEdit, isAdmi
 
       {canEdit && !local.finished && (
         <div style={{ marginTop: 12, background: C.card, border: `1px solid ${C.rule}`, borderRadius: 12, padding: 13 }}>
+          {/* Добавление игрока уже начатого турнира — зеркало снятия. Доступно,
+              пока турнир не завершён; вступивший играет со следующего раунда. */}
+          <div style={{ marginBottom: 14, paddingBottom: 14, borderBottom: `1px solid ${C.rule}` }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: adding ? 8 : 0 }}>
+              <span style={{ fontSize: 11.5, color: C.slateFaint }}>Добавить игрока в турнир</span>
+              <button onClick={() => { setAdding((v) => !v); setAddSearch(""); }} style={{
+                marginLeft: "auto", fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                background: adding ? "none" : C.court, color: adding ? C.slateFaint : "#fff",
+                border: adding ? `1px solid ${C.rule}` : "none", borderRadius: 8, padding: "6px 14px",
+              }}>{adding ? "Отмена" : "+ Добавить"}</button>
+            </div>
+            {adding && (
+              <>
+                <input value={addSearch} onChange={(e) => setAddSearch(e.target.value)} placeholder="Поиск игрока"
+                  style={{ ...inputStyle, width: "100%", marginBottom: 8 }} />
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, maxHeight: 220, overflowY: "auto" }}>
+                  {candidates.map((p) => (
+                    <button key={p.id} onClick={() => doAdd(p.id)} disabled={busy} style={{
+                      display: "flex", alignItems: "center", gap: 6, fontSize: 13,
+                      background: C.paper, color: C.ink, border: `1px solid ${C.rule}`,
+                      borderRadius: 999, padding: "5px 11px", cursor: "pointer", opacity: busy ? 0.5 : 1,
+                    }}><Avatar player={p} size={20} /> {fullName(p)}</button>
+                  ))}
+                  {candidates.length === 0 && (
+                    <span style={{ fontSize: 12.5, color: C.slateFaint }}>
+                      {addSearch.trim() ? "Никого не нашлось." : "Все игроки уже в турнире."}
+                    </span>
+                  )}
+                </div>
+                <div style={{ fontSize: 11, color: C.slateFaint, marginTop: 8, lineHeight: 1.45 }}>
+                  Вступивший играет со следующего раунда. В таблице он начинает с нуля очков,
+                  а в очередь на отдых встаёт наравне с остальными.
+                </div>
+              </>
+            )}
+          </div>
+
           <div style={{ fontSize: 11.5, color: C.slateFaint, marginBottom: 8 }}>Снять игрока с турнира (травма, уход)</div>
           {withdrawFor ? (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
@@ -553,6 +704,8 @@ function App() {
 
   const players = (data.players || []).slice().sort((a, b) => fullName(a).localeCompare(fullName(b)));
   const teams = [...(data.teams || [])].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const venues = [...(data.places || [])].sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const venueNameOf = (t) => (venues.find((v) => v.id === t.venueId) || {}).name || "";
   const tournaments = [...(data.mexicanoTournaments || [])].reverse();
   const open = tournaments.find((t) => t.id === openId);
 
@@ -591,14 +744,14 @@ function App() {
         </div>
 
         {open ? (
-          <TournamentView tournament={open} players={players} canEdit={canEdit} isAdmin={isAdmin} levels={pcrLevels}
+          <TournamentView tournament={open} players={players} venues={venues} canEdit={canEdit} isAdmin={isAdmin} levels={pcrLevels}
             onBack={() => setOpenId(null)} onUpdate={update} />
         ) : (
           <>
             {canEdit && !creating && (
               <button onClick={() => setCreating(true)} style={{ ...btn(C.ink), width: "100%", marginBottom: 16 }}>+ Новый турнир</button>
             )}
-            {creating && <CreateForm players={players} teams={teams} onCreate={create} onCancel={() => setCreating(false)} busy={busy} />}
+            {creating && <CreateForm players={players} teams={teams} venues={venues} onCreate={create} onCancel={() => setCreating(false)} busy={busy} />}
 
             {tournaments.length === 0 && !creating && (
               <div style={{ background: C.card, border: `1px dashed ${C.rule}`, borderRadius: 12, padding: 26, textAlign: "center", fontSize: 13.5, color: C.slateFaint }}>
@@ -618,7 +771,7 @@ function App() {
                       {t.finished && <span style={{ fontSize: 10, fontWeight: 400, color: C.court, border: `1px solid ${C.court}`, borderRadius: 999, padding: "1px 7px" }}>завершён</span>}
                     </div>
                     <div style={{ fontSize: 12, color: C.slateFaint, fontFamily: FONT_MONO }}>
-                      {t.date} · {(t.playerIds || []).length} игроков{out > 0 ? ` (−${out})` : ""} · раундов {(t.rounds || []).length}{t.targetRounds ? `/${t.targetRounds}` : ""} · матчей {done}
+                      {t.date}{venueNameOf(t) ? ` · ${venueNameOf(t)}` : ""} · {(t.playerIds || []).length} игроков{out > 0 ? ` (−${out})` : ""} · раундов {(t.rounds || []).length}{t.targetRounds ? `/${t.targetRounds}` : ""} · матчей {done}
                     </div>
                   </div>
                   {/* Deleting a tournament is destructive and permanent, so it is
