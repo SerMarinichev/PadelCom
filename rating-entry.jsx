@@ -50,16 +50,36 @@ const inputStyle = { fontSize: 16, border: `1px solid ${C.rule}`, borderRadius: 
 // ============================================================================
 function ShareTable({ rows, playersById, showSource }) {
   const [open, setOpen] = useState(null);
+  // Два разных вопроса к одним данным: «насколько сильно играет» (доля очков,
+  // не зависит от длины матчей) и «насколько результативно» (очки за игру,
+  // прямой аналог голов за матч). Сортировка переключается, цифры остаются.
+  const [sortBy, setSortBy] = useState("share");
   if (!rows.length) return <div style={{ ...panel, padding: 24, textAlign: "center", fontSize: 13.5, color: C.slateFaint, border: `1px dashed ${C.rule}` }}>Пока нет сыгранных матчей.</div>;
+  const sorted = sortBy === "share" ? rows : [...rows].sort((x, y) => {
+    if (x.reliable !== y.reliable) return x.reliable ? -1 : 1;
+    return y.perGame - x.perGame;
+  });
   return (
+    <>
+    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+      <span style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginRight: 2 }}>Сортировка</span>
+      {[["share", "Доля очков"], ["perGame", "За игру"]].map(([k, label]) => (
+        <button key={k} onClick={() => setSortBy(k)} style={{
+          fontSize: 12.5, fontWeight: 600, padding: "5px 12px", borderRadius: 8, cursor: "pointer",
+          background: sortBy === k ? C.ink : C.card, color: sortBy === k ? "#fff" : C.ink,
+          border: `1px solid ${sortBy === k ? C.ink : C.rule}`,
+        }}>{label}</button>
+      ))}
+    </div>
     <div style={panel}>
       <div style={headRow}>
         <span style={{ width: 26 }}>#</span><span style={{ flex: 1 }}>Игрок</span>
-        <span style={{ width: 62, textAlign: "right" }}>Рейтинг</span>
-        <span style={{ width: 38, textAlign: "right" }}>Игр</span>
-        <span style={{ width: 46, textAlign: "right" }}>Побед</span>
+        <span style={{ width: 56, textAlign: "right" }}>Доля</span>
+        <span style={{ width: 50, textAlign: "right" }}>За игру</span>
+        <span style={{ width: 34, textAlign: "right" }}>Игр</span>
+        <span style={{ width: 40, textAlign: "right" }}>Побед</span>
       </div>
-      {rows.map((r, i) => {
+      {sorted.map((r, i) => {
         const p = playersById[r.id];
         const isOpen = open === r.id;
         return (
@@ -71,15 +91,20 @@ function ShareTable({ rows, playersById, showSource }) {
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p ? fullName(p) : r.id}</span>
                 {!r.reliable && <span style={{ fontSize: 9.5, color: C.rust, border: `1px solid ${C.rust}`, borderRadius: 999, padding: "0 5px", flex: "0 0 auto" }}>мало игр</span>}
               </span>
-              <span style={{ width: 62, textAlign: "right", fontFamily: FM, fontWeight: 700, fontSize: 14.5 }}>{r.share.toFixed(1)}%</span>
-              <span style={{ width: 38, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slateFaint }}>{r.games}</span>
-              <span style={{ width: 46, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slateFaint }}>{r.wins}</span>
+              <span style={{ width: 56, textAlign: "right", fontFamily: FM, fontWeight: sortBy === "share" ? 700 : 400, fontSize: sortBy === "share" ? 14.5 : 13, color: sortBy === "share" ? C.ink : C.slate }}>{r.share.toFixed(1)}%</span>
+              <span style={{ width: 50, textAlign: "right", fontFamily: FM, fontWeight: sortBy === "perGame" ? 700 : 400, fontSize: sortBy === "perGame" ? 14.5 : 13, color: sortBy === "perGame" ? C.ink : C.slate }}>{r.perGame.toFixed(1)}</span>
+              <span style={{ width: 34, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slateFaint }}>{r.games}</span>
+              <span style={{ width: 40, textAlign: "right", fontFamily: FM, fontSize: 12, color: C.slateFaint }}>{r.wins}</span>
             </div>
             {isOpen && (
               <div style={{ padding: "10px 13px 13px 65px", background: C.paperDim, fontSize: 12.5, color: C.slate, lineHeight: 1.6, borderTop: `1px solid ${C.rule}` }}>
                 <div><b>{explainRow(r)}</b></div>
                 <div>Побед {r.wins}, поражений {r.losses}{r.draws > 0 ? `, ничьих ${r.draws}` : ""} — винрейт {r.winRate.toFixed(0)}%</div>
                 <div>Разница очков: <span style={{ color: r.diff >= 0 ? C.positive : C.negative, fontFamily: FM }}>{r.diff >= 0 ? "+" : ""}{r.diff}</span></div>
+                <div>
+                  За игру: набирает <b style={{ fontFamily: FM }}>{r.perGame.toFixed(1)}</b>, пропускает <span style={{ fontFamily: FM }}>{r.concededPerGame.toFixed(1)}</span>
+                  {" "}· разница <span style={{ color: r.diffPerGame >= 0 ? C.positive : C.negative, fontFamily: FM }}>{r.diffPerGame >= 0 ? "+" : ""}{r.diffPerGame.toFixed(1)}</span>
+                </div>
                 {showSource && <div style={{ color: C.slateFaint }}>Источник: турниры — {r.tournamentGames}, «Матчи» — {r.matchGames}</div>}
               </div>
             )}
@@ -87,6 +112,7 @@ function ShareTable({ rows, playersById, showSource }) {
         );
       })}
     </div>
+    </>
   );
 }
 
@@ -640,7 +666,14 @@ function App() {
               всегда играл против слабых, окажется выше того, кто играл против сильных. Ранжирование —
               на вкладке <b>PC Rating</b>.
               <br /><br />
-              <b>Как считается.</b> Доля очков, которую игрок забрал в своих матчах: набранные очки,
+              <b>Два показателя.</b> <b>Доля</b> — какой процент разыгранных очков игрок забрал;
+              она не зависит от того, до скольки шли матчи, и поэтому сравнима между турнирами.
+              <b>За игру</b> — сколько очков он набирает в среднем за матч, прямой аналог «голов за игру».
+              Этот показатель зависит от дистанции: в турнире до 32 он будет выше, чем до 16, при той же
+              силе игры. Сравнивайте его внутри одного формата. Переключатель выше меняет сортировку,
+              обе цифры остаются на месте.
+              <br /><br />
+              <b>Как считается доля.</b> Набранные очки,
               делённые на все разыгранные. В матче 16:8 оба игрока выигравшей пары получают 16 из 24 —
               66,7%. Количество матчей на показатель не влияет. При менее чем {MIN_GAMES_RELIABLE} играх
               значение помечается как неустойчивое. Нажмите на строку, чтобы увидеть расчёт.

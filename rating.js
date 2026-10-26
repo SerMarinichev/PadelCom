@@ -87,6 +87,13 @@ export function buildRating(data, opts = {}) {
       share: total > 0 ? (r.pointsFor / total) * 100 : 0,   // the headline number
       winRate: r.games > 0 ? (r.wins / r.games) * 100 : 0,
       diff: r.pointsFor - r.pointsAgainst,
+      // Результативность: сколько очков игрок набирает и пропускает за игру.
+      // Прямой аналог «голов за матч». В отличие от доли очков зависит от
+      // дистанции матчей, поэтому сравнима только внутри одного формата —
+      // об этом сказано в пояснении к таблице.
+      perGame: r.games > 0 ? r.pointsFor / r.games : 0,
+      concededPerGame: r.games > 0 ? r.pointsAgainst / r.games : 0,
+      diffPerGame: r.games > 0 ? (r.pointsFor - r.pointsAgainst) / r.games : 0,
       reliable: r.games >= (opts.minGames || MIN_GAMES_RELIABLE),
     };
   });
@@ -108,5 +115,7 @@ export function buildRating(data, opts = {}) {
 // show its own arithmetic instead of asking people to trust it.
 export function explainRow(row) {
   const total = row.pointsFor + row.pointsAgainst;
-  return `${row.pointsFor} из ${total} разыгранных очков в ${row.games} играх`;
+  const per = row.games > 0 ? (row.pointsFor / row.games).toFixed(1) : "0";
+  const conc = row.games > 0 ? (row.pointsAgainst / row.games).toFixed(1) : "0";
+  return `${row.pointsFor} из ${total} разыгранных очков в ${row.games} играх — ${per} за игру при ${conc} пропущенных`;
 }
