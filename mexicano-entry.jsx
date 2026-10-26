@@ -261,7 +261,53 @@ function CreateForm({ players, teams, venues, onCreate, onCancel, busy }) {
 // ============================================================================
 // Standings
 // ============================================================================
+// Раскладка выступления одного игрока внутри турнира: что было в каждом
+// раунде и как накапливался счёт. Считается из самих раундов, а не из итоговой
+// таблицы, — поэтому расхождения между раскрытой строкой и строкой итога
+// невозможны по построению.
+function playerTournamentBreakdown(tournament, playerId) {
+  const entries = [];
+  let scored = 0, conceded = 0, wins = 0, losses = 0, draws = 0, sitOuts = 0;
+  (tournament.rounds || []).forEach((round, ri) => {
+    const match = (round.matches || []).find((m) => [...(m.team1 || []), ...(m.team2 || [])].includes(playerId));
+    if (!match) {
+      if ((round.sitting || []).includes(playerId)) {
+        sitOuts += 1;
+        entries.push({ round: ri + 1, rested: true, scored, conceded });
+      }
+      return;
+    }
+    const mine = (match.team1 || []).includes(playerId) ? match.team1 : match.team2;
+    const theirs = (match.team1 || []).includes(playerId) ? match.team2 : match.team1;
+    const my = (match.team1 || []).includes(playerId) ? match.score1 : match.score2;
+    const their = (match.team1 || []).includes(playerId) ? match.score2 : match.score1;
+    const played = my !== null && my !== undefined && their !== null && their !== undefined;
+    if (played) {
+      scored += Number(my); conceded += Number(their);
+      if (Number(my) > Number(their)) wins += 1;
+      else if (Number(my) < Number(their)) losses += 1;
+      else draws += 1;
+    }
+    entries.push({
+      round: ri + 1, rested: false, played,
+      partner: (mine || []).find((x) => x !== playerId) || null,
+      opponents: theirs || [],
+      my: played ? Number(my) : null,
+      their: played ? Number(their) : null,
+      scored, conceded,
+    });
+  });
+  const games = wins + losses + draws;
+  return {
+    entries, scored, conceded, wins, losses, draws, games, sitOuts,
+    perGame: games ? scored / games : 0,
+    concededPerGame: games ? conceded / games : 0,
+    share: scored + conceded ? (scored / (scored + conceded)) * 100 : 0,
+  };
+}
+
 function StandingsTable({ tournament, standings, playersById }) {
+  const [open, setOpen] = useState(null);
   const nameOf = (id) => (playersById[id] ? fullName(playersById[id]) : "—");
   const rows = sortedStandings(standings, nameOf);
   const withdrawnIds = new Set((tournament.withdrawals || []).map((w) => w.playerId));
@@ -282,8 +328,12 @@ function StandingsTable({ tournament, standings, playersById }) {
       {rows.map((r, i) => {
         const p = playersById[r.id];
         const out = withdrawnIds.has(r.id);
+        const isOpen = open === r.id;
+        const br = isOpen ? playerTournamentBreakdown(tournament, r.id) : null;
+        const peak = br ? Math.max(1, ...br.entries.filter((e) => e.played).map((e) => Math.max(e.my, e.their))) : 1;
         return (
-          <div key={r.id} style={{ display: "flex", alignItems: "center", padding: "9px 14px", borderTop: `1px solid ${C.rule}`, background: i === 0 && !out ? "#F6FBF8" : C.card, opacity: out ? 0.55 : 1 }}>
+          <div key={r.id}>
+          <div onClick={() => setOpen(isOpen ? null : r.id)} style={{ display: "flex", alignItems: "center", padding: "9px 14px", borderTop: `1px solid ${C.rule}`, background: isOpen ? C.paperDim : (i === 0 && !out ? "#F6FBF8" : C.card), opacity: out ? 0.55 : 1, cursor: "pointer" }}>
             <span style={{ width: 24, fontFamily: FONT_MONO, fontSize: 12.5, color: i === 0 && !out ? C.court : C.slateFaint, fontWeight: i === 0 && !out ? 700 : 400 }}>{i + 1}</span>
             <span style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, fontSize: 13.5, minWidth: 0 }}>
               <Avatar player={p} size={24} dim={out} />
@@ -303,6 +353,74 @@ function StandingsTable({ tournament, standings, playersById }) {
             </span>
             <span style={{ width: 34, textAlign: "right", fontFamily: FONT_MONO, fontSize: 12, color: C.slateFaint }}>{r.played}</span>
             <span style={{ width: 62, textAlign: "right", fontFamily: FONT_MONO, fontSize: 12, color: r.sitOuts > 0 ? C.rust : C.slateFaint }}>{r.sitOuts}</span>
+          </div>
+
+          {isOpen && br && (
+            <div style={{ padding: "12px 14px 14px", background: C.paperDim, borderTop: `1px solid ${C.rule}` }}>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginBottom: 12 }}>
+                {[
+                  ["Забито", br.scored, C.ink],
+                  ["Пропущено", br.conceded, C.slate],
+                  ["Разница", `${br.scored - br.conceded >= 0 ? "+" : ""}${br.scored - br.conceded}`, br.scored - br.conceded >= 0 ? C.positive : C.negative],
+                  ["За игру", br.perGame.toFixed(1), C.ink],
+                  ["Доля очков", `${br.share.toFixed(1)}%`, C.ink],
+                  ["Баланс", `${br.wins}–${br.losses}${br.draws ? `–${br.draws}` : ""}`, C.slate],
+                ].map(([label, value, color]) => (
+                  <div key={label} style={{ minWidth: 68 }}>
+                    <div style={{ fontSize: 10, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</div>
+                    <div style={{ fontFamily: FONT_MONO, fontSize: 15, fontWeight: 700, color }}>{value}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Забито и пропущено по раундам: столбик вверх — свои очки,
+                  вниз — очки соперников. Видно, где результат просел. */}
+              <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>По раундам</div>
+              <div style={{ display: "flex", gap: 5, alignItems: "flex-end", overflowX: "auto", paddingBottom: 4, marginBottom: 12 }}>
+                {br.entries.map((e) => (
+                  <div key={e.round} style={{ flex: "0 0 auto", width: 34, textAlign: "center" }}>
+                    <div style={{ height: 40, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+                      {e.played && <div style={{ width: 16, height: Math.max(2, (e.my / peak) * 40), background: C.court, borderRadius: "3px 3px 0 0" }} />}
+                    </div>
+                    <div style={{ height: 1, background: C.rule }} />
+                    <div style={{ height: 40, display: "flex", alignItems: "flex-start", justifyContent: "center" }}>
+                      {e.played && <div style={{ width: 16, height: Math.max(2, (e.their / peak) * 40), background: C.rule, borderRadius: "0 0 3px 3px" }} />}
+                    </div>
+                    <div style={{ fontSize: 10, fontFamily: FONT_MONO, color: e.played ? C.ink : C.slateFaint, marginTop: 2 }}>
+                      {e.played ? `${e.my}:${e.their}` : (e.rested ? "—" : "·")}
+                    </div>
+                    <div style={{ fontSize: 9.5, color: C.slateFaint }}>р.{e.round}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ fontSize: 11, color: C.slateFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>Матчи</div>
+              {br.entries.map((e, k) => (
+                <div key={k} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, padding: "5px 0", borderTop: k ? `1px solid ${C.rule}` : "none" }}>
+                  <span style={{ width: 28, fontFamily: FONT_MONO, fontSize: 11, color: C.slateFaint }}>р.{e.round}</span>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    {e.rested ? (
+                      <span style={{ color: C.rust }}>отдыхал</span>
+                    ) : (
+                      <span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {e.partner ? `с ${nameOf(e.partner)}` : "один"} против {(e.opponents || []).map(nameOf).join(" / ")}
+                      </span>
+                    )}
+                  </span>
+                  {!e.rested && (
+                    <>
+                      <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, width: 50, textAlign: "right", fontWeight: e.played && e.my > e.their ? 700 : 400 }}>
+                        {e.played ? `${e.my}:${e.their}` : "—"}
+                      </span>
+                      <span title="Накопленные очки после этого раунда" style={{ fontFamily: FONT_MONO, fontSize: 11, width: 68, textAlign: "right", color: C.slateFaint, whiteSpace: "nowrap" }}>
+                        {e.played ? `итого ${e.scored}` : ""}
+                      </span>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
           </div>
         );
       })}
