@@ -787,7 +787,10 @@ function TournamentView({ tournament, players, venues, onBack, onUpdate, canEdit
               {busy ? "Сохранение…" : "Сохранить счёт"}
             </button>
           )}
-          {!local.finished && isAdmin && (
+          {/* Для турнира задним числом ручной ввод — единственный способ внести
+              раунд, поэтому он доступен всем, кто вправе вести турнир. Для
+              обычного турнира это обход жеребьёвки, и он остаётся за админом. */}
+          {!local.finished && (local.manual || isAdmin) && (
             <button onClick={() => setManualRound(true)} disabled={busy || manualRound}
               title="Самостоятельно указать составы и счёт — для турниров, вносимых задним числом"
               style={{ ...btn("none", C.action), border: `1px solid ${C.action}`, opacity: busy || manualRound ? 0.45 : 1 }}>
