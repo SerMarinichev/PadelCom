@@ -98,6 +98,44 @@ function todayISOServer() {
   return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Tashkent" });
 }
 
+// Полная отметка времени для журналирования. Всегда серверная и всегда в UTC:
+// часы на телефоне организатора могут отставать на часы, а «зафиксировано в
+// 19:42» имеет смысл только тогда, когда это время проставил не тот, кто вносит
+// данные. Отображается уже в местном поясе.
+function nowISOServer() {
+  return new Date().toISOString();
+}
+
+// Проставляет отметки времени раундам и матчам турнира, сравнивая присланное
+// состояние с тем, что лежит на сервере. Новый раунд получает createdAt,
+// матч с впервые внесённым или изменённым счётом — scoredAt и автора.
+// Неизменившиеся матчи сохраняют свою прежнюю отметку, иначе любое сохранение
+// турнира переписывало бы время ввода всех результатов разом.
+function stampTournamentRounds(prev, incoming, actor) {
+  const now = nowISOServer();
+  const prevRounds = (prev && prev.rounds) || [];
+  const nextRounds = Array.isArray(incoming.rounds) ? incoming.rounds : prevRounds;
+  return nextRounds.map((r, ri) => {
+    const old = prevRounds[ri] || null;
+    const oldMatches = (old && old.matches) || [];
+    const matches = (r.matches || []).map((m, mi) => {
+      const om = oldMatches[mi] || null;
+      const filled = m.score1 !== null && m.score1 !== undefined && m.score2 !== null && m.score2 !== undefined;
+      if (!filled) return { ...m, scoredAt: null, scoredBy: null };
+      const unchanged = om && Number(om.score1) === Number(m.score1) && Number(om.score2) === Number(m.score2);
+      // Неизменившийся результат сохраняет свою отметку — в том числе пустую.
+      // Турниры, игравшиеся до появления этой механики, отметок не имеют, и
+      // проставлять им «сейчас» нельзя: это выдало бы время обновления за время
+      // игры. Пустое поле честнее неверного.
+      if (unchanged) return { ...m, scoredAt: om.scoredAt || null, scoredBy: om.scoredBy || null };
+      return { ...m, scoredAt: now, scoredBy: actor };
+    });
+    // Время ставится только действительно новому раунду; у ранее существовавших
+    // остаётся то, что было, даже если это пусто.
+    return { ...r, matches, createdAt: old ? (old.createdAt || null) : (r.createdAt || now) };
+  });
+}
+
 const MATCH_FLOW_STEPS = ["type", "p1a", "p1b", "p2a", "p2b", "score"];
 // In-memory (not persisted to GitHub) — deliberately so: this only needs to survive
 // for the few seconds Telegram might take to retry a slow-to-acknowledge webhook
@@ -124,6 +162,12 @@ function flowKey(chatId) { return `${chatId}`; }
 // middle of the flow for two taps to race against anymore. The player list itself
 // (names, ids) is captured into the flow once at /матч time, so later steps don't
 // need to touch storage at all — only the final score does.
+// Диагностика бота: держится в памяти процесса и намеренно не сохраняется.
+// Переживать перезапуск ей не нужно — она отвечает на вопрос «доходит ли до нас
+// что-нибудь прямо сейчас», а ради этого ответа переписывать базу нельзя.
+let lastTelegramEvent = null;
+let lastTelegramCommand = null;
+
 const telegramFlows = new Map();
 
 async function startMatchFlow(data, chatId, starterName) {
@@ -344,7 +388,16 @@ let githubSaveQueue = Promise.resolve();
 async function loadBlob() {
   if (!githubConfigured()) throw new Error("GITHUB_TOKEN / GITHUB_REPO не настроены");
   const r = await githubRequest("GET", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`);
-  if (r.status === 404) return {}; // no data file yet — first run
+  if (r.status === 404) {
+    // Раньше здесь возвращался пустой объект «как при первом запуске». Из-за
+    // этого исчезнувший или переименованный файл выглядел исправно работающей
+    // пустой базой: приложение поднималось, админка показывала нули, а первое
+    // же сохранение закрепляло пустоту. Теперь это явная ошибка, а создание
+    // файла с нуля — отдельное осознанное действие (/api/admin/storage/init).
+    const err = new Error(`github 404: файл данных ${GITHUB_DATA_PATH} не найден в ${GITHUB_REPO}. Проверьте GITHUB_REPO, GITHUB_DATA_PATH и ветку по умолчанию. Если база действительно создаётся с нуля — используйте инициализацию в админ-панели.`);
+    err.code = "data-file-missing";
+    throw err;
+  }
   if (!r.ok) {
     const body = await r.text().catch(() => "");
     throw new Error(`github ${r.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
@@ -380,18 +433,87 @@ async function updateBlob(mutator) {
   githubSaveQueue = task.catch(() => {});
   return task;
 }
-async function saveBlobInner(data, attempt = 1) {
+// Коллекции, потеря которых означает потерю базы. Служебные ключи
+// (telegramLastEvent, telegramChats, настройки) сюда не входят: они по природе
+// перезаписываются целиком.
+const PROTECTED_COLLECTIONS = [
+  "players", "places", "placeTypes", "sessions", "eventTypes", "tournaments",
+  "mexicanoTournaments", "matchRecords", "teams", "pairs", "polls",
+  "closedTransfers", "articles", "videos",
+];
+
+// Последний рубеж перед записью в хранилище. Через saveBlobInner проходит КАЖДАЯ
+// запись — автосохранение приложения, админские маршруты, бот, вход игрока, —
+// поэтому проверка стоит здесь, а не в отдельных обработчиках.
+//
+// 23 октября база была стёрта полной заменой объекта: все коллекции оказались
+// пустыми массивами, и ни один слой этого не заметил. Проверка ниже отклоняет
+// такую запись и называет, что именно пропадало.
+function assessDestructiveWrite(current, next) {
+  if (!current || typeof current !== "object" || Array.isArray(current)) return null;
+  if (!next || typeof next !== "object" || Array.isArray(next)) {
+    return "новое состояние не является объектом данных";
+  }
+  const emptied = [];
+  let before = 0, after = 0;
+  PROTECTED_COLLECTIONS.forEach((key) => {
+    const oldArr = Array.isArray(current[key]) ? current[key] : null;
+    if (!oldArr) return;
+    const newArr = Array.isArray(next[key]) ? next[key] : [];
+    before += oldArr.length;
+    after += newArr.length;
+    // Коллекция, в которой что-то было, не может стать пустой одной записью.
+    if (oldArr.length >= 3 && newArr.length === 0) {
+      emptied.push(`${key}: было ${oldArr.length}, стало 0`);
+      return;
+    }
+    // И не может разом потерять больше половины. Точечные удаления идут по
+    // одному и сюда не попадают; срабатывает только массовая потеря в одном
+    // сохранении — признак устаревшего или сломанного клиента.
+    if (oldArr.length >= 5 && newArr.length < oldArr.length / 2) {
+      emptied.push(`${key}: было ${oldArr.length}, стало ${newArr.length}`);
+    }
+  });
+  if (emptied.length) return `теряются записи — ${emptied.join("; ")}`;
+  // Массовая потеря без полного обнуления: больше половины записей разом.
+  const lost = before - after;
+  if (before >= 20 && lost >= 10 && after < before / 2) {
+    return `пропадает больше половины записей — было ${before}, станет ${after}`;
+  }
+  return null;
+}
+
+async function saveBlobInner(data, attempt = 1, allowDestructive = false) {
   if (!githubConfigured()) throw new Error("GITHUB_TOKEN / GITHUB_REPO не настроены");
   // GitHub requires the current file's sha to update it (prevents silently clobbering
   // a concurrent write) — fetch it fresh every time rather than caching in memory.
   let sha;
+  let currentData = null;
   const getR = await githubRequest("GET", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`);
   if (getR.ok) {
-    sha = (await getR.json()).sha;
+    const j = await getR.json();
+    sha = j.sha;
+    // Содержимое уже пришло этим же запросом — разбираем его для проверки ниже,
+    // отдельного обращения к GitHub не требуется.
+    try {
+      const txt = Buffer.from(j.content, "base64").toString("utf8");
+      currentData = txt ? JSON.parse(txt) : null;
+    } catch { currentData = null; }
   } else if (getR.status !== 404) {
     const body = await getR.text().catch(() => "");
     throw new Error(`github ${getR.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
   }
+
+  if (!allowDestructive) {
+    const problem = assessDestructiveWrite(currentData, data);
+    if (problem) {
+      console.error(`[saveBlob] ЗАПИСЬ ОТКЛОНЕНА: ${problem}`);
+      const err = new Error(`Запись отклонена: ${problem}. Если это намеренная массовая очистка, выполните её через админ-панель по частям.`);
+      err.code = "destructive-write";
+      throw err;
+    }
+  }
+
   const payload = JSON.stringify(data, null, 2);
   const content = Buffer.from(payload, "utf8").toString("base64");
   const putR = await githubRequest("PUT", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`, {
@@ -406,7 +528,7 @@ async function saveBlobInner(data, attempt = 1) {
     // enough; if it still fails, something else is genuinely wrong and should surface.
     if (putR.status === 409 && attempt < 3) {
       console.log(`[saveBlob] sha conflict, retrying (attempt ${attempt + 1})`);
-      return saveBlobInner(data, attempt + 1);
+      return saveBlobInner(data, attempt + 1, allowDestructive);
     }
     const body = await putR.text().catch(() => "");
     throw new Error(`github ${putR.status} (payload ${(payload.length / 1024).toFixed(0)}KB)${body ? `: ${body.slice(0, 300)}` : ""}`);
@@ -808,6 +930,31 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- Telegram bot integration ----
+  // Создание файла данных с нуля. Отдельное действие именно потому, что
+  // автоматическое создание и привело к потере: отсутствие файла больше не
+  // трактуется как «новая база». Работает только если файла действительно нет.
+  if (url === "/api/admin/storage/init" && req.method === "POST") {
+    if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
+    try {
+      const probe = await githubRequest("GET", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`);
+      if (probe.ok) {
+        send(res, 409, JSON.stringify({ error: "file-exists", detail: "Файл данных уже существует — инициализация отменена." }), { "Content-Type": "application/json" });
+        return;
+      }
+      if (probe.status !== 404) {
+        const body = await probe.text().catch(() => "");
+        throw new Error(`github ${probe.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
+      }
+      const empty = {};
+      PROTECTED_COLLECTIONS.forEach((k) => { empty[k] = []; });
+      await saveBlobInner(empty, 1, true);
+      send(res, 200, JSON.stringify({ ok: true, created: true }), { "Content-Type": "application/json" });
+    } catch (e) {
+      send(res, 502, JSON.stringify({ error: "storage error", detail: String(e.message || e) }), { "Content-Type": "application/json" });
+    }
+    return;
+  }
+
   if (url === "/api/admin/storage/status" && req.method === "GET") {
     if (!isAdminRequest(req)) { send(res, 401, JSON.stringify({ error: "not authenticated" }), { "Content-Type": "application/json" }); return; }
     const result = { configured: githubConfigured(), repo: GITHUB_REPO, path: GITHUB_DATA_PATH, connected: false, fileExists: false, error: "" };
@@ -815,7 +962,10 @@ const server = http.createServer(async (req, res) => {
       try {
         const r = await githubRequest("GET", `/repos/${GITHUB_REPO}/contents/${GITHUB_DATA_PATH}`);
         if (r.ok) { result.connected = true; result.fileExists = true; }
-        else if (r.status === 404) { result.connected = true; result.fileExists = false; }
+        else if (r.status === 404) {
+          result.connected = true; result.fileExists = false;
+          result.error = "Файл данных не найден. Приложение не будет работать, пока файл не вернут или не создадут заново.";
+        }
         else { const body = await r.text().catch(() => ""); result.error = `${r.status}${body ? `: ${body.slice(0, 200)}` : ""}`; }
       } catch (e) {
         result.error = String(e);
@@ -843,8 +993,10 @@ const server = http.createServer(async (req, res) => {
         pendingUpdates: info ? info.pending_update_count : null,
         lastDeliveryError: info ? info.last_error_message : "",
         lastDeliveryErrorAt: info && info.last_error_date ? new Date(info.last_error_date * 1000).toISOString() : "",
-        lastEvent: data.telegramLastEvent || null,
-        matchDebug: data.telegramMatchDebug || null,
+        // Из памяти процесса; после перезапуска сервера пусто, пока не придёт
+        // первое событие — это ожидаемо и лучше, чем коммит на каждое сообщение.
+        lastEvent: lastTelegramEvent || data.telegramLastEvent || null,
+        matchDebug: lastTelegramCommand || data.telegramMatchDebug || null,
         chats: data.telegramChats || [],
         selectedChatId: data.telegramChatId || "",
       }), { "Content-Type": "application/json" });
@@ -919,8 +1071,12 @@ async function processTelegramUpdate(update, data) {
       // from a server-side one (chat/poll matching, storage save failing). Kept here
       // (not just in Render's own logs) because that log viewer has repeatedly proven
       // awkward to read live — the admin panel is a more reliable channel for this.
-      data.telegramLastEvent = { type: Object.keys(update).find((k) => k !== "update_id") || "unknown", at: new Date().toISOString() };
-      changed = true;
+      // Диагностическая метка живёт В ПАМЯТИ процесса, а не в базе. Раньше она
+      // писалась в данные и выставляла changed = true безусловно — то есть любое
+      // сообщение в группе, включая разговоры не по делу, вызывало полную запись
+      // базы в GitHub. Отсюда тысячи коммитов и, главное, секундное окно между
+      // сбоем хранилища и затиранием базы. Админка читает метку из памяти.
+      lastTelegramEvent = { type: Object.keys(update).find((k) => k !== "update_id") || "unknown", at: new Date().toISOString() };
 
       // Remember any chat the bot has seen a message in, so the admin can pick it from
       // a list instead of hunting down a numeric chat id by hand.
@@ -929,9 +1085,16 @@ async function processTelegramUpdate(update, data) {
         data.telegramChats = data.telegramChats || [];
         const existing = data.telegramChats.find((c) => String(c.id) === String(chat.id));
         const title = chat.title || [chat.first_name, chat.last_name].filter(Boolean).join(" ") || chat.username || String(chat.id);
-        if (existing) existing.title = title;
-        else data.telegramChats.push({ id: chat.id, title });
-        changed = true;
+        // Сохраняем, только если список чатов реально изменился. Раньше changed
+        // взводился и для давно известного чата с тем же названием, поэтому
+        // каждое сообщение в группе всё равно уходило коммитом в хранилище.
+        if (!existing) {
+          data.telegramChats.push({ id: chat.id, title });
+          changed = true;
+        } else if (existing.title !== title) {
+          existing.title = title;
+          changed = true;
+        }
       }
 
       // /матч (or /match) command: starts the step-by-step "add a match" bot flow.
@@ -943,7 +1106,7 @@ async function processTelegramUpdate(update, data) {
         const starterName = [fromUser.first_name, fromUser.last_name].filter(Boolean).join(" ") || fromUser.username || "кто-то";
         const isMatchCmd = /^\/(матч|match)(@\w+)?/i.test(text);
         const isCancelCmd = /^\/(отмена|cancel)(@\w+)?/i.test(text);
-        data.telegramMatchDebug = { text, isMatchCmd, at: new Date().toISOString(), result: "" };
+        lastTelegramCommand = { text, isMatchCmd, at: new Date().toISOString(), result: "" };
         console.log(`[telegram webhook] message text=${JSON.stringify(text)} isMatchCommand=${isMatchCmd} hasActiveFlow=${telegramFlows.has(flowKey(chatId))}`);
         if (isCancelCmd) {
           cancelMatchFlow(chatId);
@@ -951,9 +1114,9 @@ async function processTelegramUpdate(update, data) {
           changed = true;
         } else if (isMatchCmd) {
           try {
-            data.telegramMatchDebug.result = await startMatchFlow(data, chatId, starterName);
+            lastTelegramCommand.result = await startMatchFlow(data, chatId, starterName);
           } catch (flowErr) {
-            data.telegramMatchDebug.result = `error: ${String(flowErr.message || flowErr)}`;
+            lastTelegramCommand.result = `error: ${String(flowErr.message || flowErr)}`;
           }
           changed = true;
         } else if (telegramFlows.has(flowKey(chatId))) {
@@ -1182,7 +1345,9 @@ async function processTelegramUpdate(update, data) {
   // same serialized queue, so one organiser entering scores can't be clobbered by
   // someone else's unrelated autosave.
   if (url === "/api/mexicano" && req.method === "POST") {
-    if (!playerSessionFromRequest(req) && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    const creatorSession = playerSessionFromRequest(req);
+    if (!creatorSession && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    const creator = creatorSession ? creatorSession.playerId : "admin";
     try {
       const body = await readJsonBody(req);
       let created = null;
@@ -1195,12 +1360,14 @@ async function processTelegramUpdate(update, data) {
           courts: Number(body.courts) || 1,
           format: body.format === "americano" ? "americano" : "mexicano",
           seeding: body.seeding === "1+3" ? "1+3" : "1+4",
+          venueId: typeof body.venueId === "string" && body.venueId ? body.venueId : null,
           targetRounds: Number(body.targetRounds) > 0 ? Number(body.targetRounds) : null,
           playerIds: Array.isArray(body.playerIds) ? body.playerIds : [],
           withdrawals: [],
           rounds: [],
           finished: false,
-          createdAt: new Date().toISOString(),
+          createdAt: nowISOServer(),
+          createdBy: creator,
         };
         data.mexicanoTournaments = [...(data.mexicanoTournaments || []), created];
         return data;
@@ -1213,22 +1380,52 @@ async function processTelegramUpdate(update, data) {
   }
 
   if (url.startsWith("/api/mexicano/") && req.method === "PUT") {
-    if (!playerSessionFromRequest(req) && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    const editorSession = playerSessionFromRequest(req);
+    if (!editorSession && !isAdminRequest(req)) { send(res, 403, JSON.stringify({ error: "not-verified" }), { "Content-Type": "application/json" }); return; }
+    const editor = editorSession ? editorSession.playerId : "admin";
     const id = decodeURIComponent(url.slice("/api/mexicano/".length));
     try {
       const body = await readJsonBody(req);
       let found = false;
+      let saved = null;
       await updateBlob((data) => {
         data.mexicanoTournaments = (data.mexicanoTournaments || []).map((t) => {
           if (t.id !== id) return t;
           found = true;
-          // id/createdAt are server-owned and never taken from the client.
-          return { ...t, ...body, id: t.id, createdAt: t.createdAt };
+          // id/createdAt/createdBy и все отметки времени — серверные: клиент их
+          // не задаёт и не может переписать.
+          const rounds = stampTournamentRounds(t, body, editor);
+          // Записи о вступлении: чистим поля и ставим серверное время. Клиент
+          // присылает только кто, с какого раунда и с каким базовым уровнем
+          // пропусков; момент вступления фиксирует сервер.
+          const joins = Array.isArray(body.joins)
+            ? body.joins.filter((j) => j && typeof j.playerId === "string").map((j) => {
+                const was = (t.joins || []).find((x) => x.playerId === j.playerId);
+                return {
+                  playerId: j.playerId,
+                  round: Number.isFinite(Number(j.round)) ? Number(j.round) : 0,
+                  baselineSitOuts: Number.isFinite(Number(j.baselineSitOuts)) ? Number(j.baselineSitOuts) : 0,
+                  at: (was && was.at) || nowISOServer(),
+                };
+              })
+            : (t.joins || []);
+          const venueId = body.venueId === undefined
+            ? (t.venueId || null)
+            : (typeof body.venueId === "string" && body.venueId ? body.venueId : null);
+          const next = {
+            ...t, ...body, rounds, venueId, joins,
+            id: t.id, createdAt: t.createdAt, createdBy: t.createdBy || null,
+            updatedAt: nowISOServer(), updatedBy: editor,
+          };
+          saved = next;
+          return next;
         });
         return data;
       });
       if (!found) { send(res, 404, JSON.stringify({ error: "not found" }), { "Content-Type": "application/json" }); return; }
-      send(res, 200, JSON.stringify({ ok: true }), { "Content-Type": "application/json" });
+      // Возвращаем турнир со свежими серверными отметками: иначе клиент не
+      // увидит время внесения результата до перезагрузки страницы.
+      send(res, 200, JSON.stringify({ ok: true, tournament: saved }), { "Content-Type": "application/json" });
     } catch (e) {
       send(res, 502, JSON.stringify({ error: "storage error", detail: String(e) }), { "Content-Type": "application/json" });
     }

@@ -26,6 +26,17 @@ const pairKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 // A withdrawal (injury, had to leave) takes a player out of all future rounds
 // but keeps every point they already earned — they stay in the table with the
 // games they actually played.
+// Базовый уровень пропусков для игрока, вступающего в турнир прямо сейчас:
+// среднее по тем, кто уже в игре. Вызывается в момент добавления, результат
+// сохраняется в записи о вступлении.
+export function joinBaselineSitOuts(tournament) {
+  const history = buildHistory(tournament);
+  const active = activePlayerIds(tournament);
+  if (!active.length || !(tournament.rounds || []).length) return 0;
+  const total = active.reduce((sum, id) => sum + (history.sitOuts[id] || 0), 0);
+  return Math.round(total / active.length);
+}
+
 export function activePlayerIds(tournament) {
   const out = new Set((tournament.withdrawals || []).map((w) => w.playerId));
   return (tournament.playerIds || []).filter((id) => !out.has(id));
@@ -42,6 +53,20 @@ export function buildHistory(tournament) {
   const played = {};    // playerId -> rounds actually on court
 
   (tournament.playerIds || []).forEach((id) => { sitOuts[id] = 0; played[id] = 0; lastSat[id] = -1; });
+
+  // Игрок, добавленный по ходу турнира, не участвовал в прошедших раундах и
+  // потому имеет ноль пропусков. Само по себе это отправило бы его отдыхать
+  // первым же раундом: selectSitters сажает тех, у кого пропусков меньше всего.
+  // Поэтому ему засчитывается базовый уровень — средний по тем, кто уже играл
+  // на момент его вступления. Он встаёт в середину очереди на отдых: ни сразу
+  // на скамейку, ни с правом играть без перерыва, пока остальные догоняют.
+  // Базовый уровень фиксируется при добавлении и дальше не пересчитывается,
+  // иначе очередь менялась бы задним числом с каждым новым раундом.
+  (tournament.joins || []).forEach((j) => {
+    if (j && j.playerId && sitOuts[j.playerId] !== undefined && Number.isFinite(Number(j.baselineSitOuts))) {
+      sitOuts[j.playerId] = Number(j.baselineSitOuts);
+    }
+  });
 
   (tournament.rounds || []).forEach((round, ri) => {
     (round.sitting || []).forEach((id) => {
@@ -95,7 +120,23 @@ export function selectSitters(active, history, courts) {
 // more than a repeated opponent. Squaring the counts means a third meeting is
 // penalised much harder than a second, which spreads repeats out once they
 // become unavoidable instead of piling them onto the same two people.
-function costOf(matches, history) {
+// How much an uneven match costs relative to a repeated partnership. Mexicano
+// exists to produce level matches, so balance has to dominate: a repeat is a
+// mild annoyance, a one-sided match is the thing players actually complain
+// about — and worse, it looks arbitrary, because the visible 1+4 rule appears
+// to have been ignored for no reason they can see.
+const BALANCE_WEIGHT = 60;
+
+// Strength gap between the two pairs of one match, in rating points.
+function gapOf(m, strength) {
+  if (!strength) return 0;
+  const s = (id) => strength(id);
+  const a = s(m.team1[0]) + s(m.team1[1]);
+  const b = s(m.team2[0]) + s(m.team2[1]);
+  return Math.abs(a - b);
+}
+
+function costOf(matches, history, strength, balanceWeight = 0) {
   let cost = 0;
   matches.forEach((m) => {
     const [a, b] = m.team1, [c, d] = m.team2;
@@ -106,6 +147,10 @@ function costOf(matches, history) {
       const oc = history.opponent[pairKey(x, y)] || 0;
       cost += oc * oc;
     });
+    if (balanceWeight > 0) {
+      const g = gapOf(m, strength);
+      cost += balanceWeight * g * g;
+    }
   });
   return cost;
 }
@@ -131,7 +176,8 @@ function splitsOfFour(g) {
 // ranks 1-4 play court 1, 5-8 court 2, and so on. The only freedom is how each
 // four splits into two pairs — so that's where repeats get avoided. The
 // configured scheme (1+4 by default) wins whenever it doesn't repeat anything.
-function buildMexicanoRound(activePlayers, standings, history, courts, seeding, roundIndex) {
+function buildMexicanoRound(activePlayers, standings, history, courts, seeding, roundIndex, strength) {
+  const GAP_TOLERANCE = 0.6;
   const sitters = selectSitters(activePlayers.map((p) => p.id), history, courts);
   const sitSet = new Set(sitters);
   const playing = activePlayers.filter((p) => !sitSet.has(p.id));
@@ -149,18 +195,31 @@ function buildMexicanoRound(activePlayers, standings, history, courts, seeding, 
 
   // Pick the cheapest of the three ways to split one group of four, preferring
   // the configured scheme when nothing repeats either way.
+  // Within a court the four are ordered by actual level, not by tournament
+  // points. That is what makes the visible rule honest: seat 1 really is the
+  // strongest of the four, so "1 plays with 4" genuinely produces the evenest
+  // match, and the badge a player sees explains the pairing they got.
+  //
+  // The configured scheme is the default. An alternative is accepted only when
+  // it avoids a repeat *and* its matches are no more lopsided than the default
+  // by more than GAP_TOLERANCE — so variety is taken wherever it is nearly
+  // free, and never at the price of a visibly unfair match.
   const bestSplitFor = (group) => {
-    const options = splitsOfFour(group).sort((x, y) => {
-      if (x.scheme === seeding && y.scheme !== seeding) return -1;
-      if (y.scheme === seeding && x.scheme !== seeding) return 1;
-      return 0;
+    const ordered = [...group].sort((a, b) => strength(b) - strength(a));
+    const options = splitsOfFour(ordered);
+    const preferred = options.find((o) => o.scheme === seeding) || options[0];
+    const gapOfSplit = (o) => gapOf(o, strength);
+    const baseGap = gapOfSplit(preferred);
+    const repeatCost = (o) => costOf([o], history, null, 0);
+
+    let best = preferred, bestRepeat = repeatCost(preferred);
+    options.forEach((o) => {
+      if (o === preferred) return;
+      if (gapOfSplit(o) > baseGap + GAP_TOLERANCE) return;   // too lopsided
+      const rc = repeatCost(o);
+      if (rc < bestRepeat) { bestRepeat = rc; best = o; }
     });
-    let best = options[0], bestCost = costOf([options[0]], history);
-    options.slice(1).forEach((opt) => {
-      const c = costOf([opt], history);
-      if (c < bestCost) { bestCost = c; best = opt; }
-    });
-    return { split: best, cost: bestCost };
+    return { split: best, cost: bestRepeat + BALANCE_WEIGHT * gapOfSplit(best) ** 2 };
   };
 
   let order = ranked.map((p) => p.id);
@@ -177,16 +236,35 @@ function buildMexicanoRound(activePlayers, standings, history, courts, seeding, 
   // close enough to be interchangeable (within three places, so nobody is moved
   // out of their competitive bracket) breaks those forced repeats while leaving
   // the standings-based seeding essentially intact.
-  let current = totalCost(order);
-  for (let pass = 0; pass < 4 && current > 0; pass++) {
+  // Moving a player between courts does not touch the 1+4 rule — it only
+  // changes which four share a court, and with seats ordered by level inside
+  // the court the player still sees a seat number that matches the pairing.
+  // So neighbouring ranks may trade courts whenever that reduces repeats and
+  // the matches stay as even: variety recovered without anything a player
+  // could point at as unexplained.
+  const repeatsOnly = (ids) => groupsOf(ids).reduce((sum, g) => {
+    const { split } = bestSplitFor(g);
+    return sum + costOf([split], history, null, 0);
+  }, 0);
+  const gapSum = (ids) => groupsOf(ids).reduce((sum, g) => {
+    const { split } = bestSplitFor(g);
+    return sum + gapOf(split, strength);
+  }, 0);
+
+  let curRepeats = repeatsOnly(order);
+  let curGap = gapSum(order);
+  for (let pass = 0; pass < 6 && curRepeats > 0; pass++) {
     let improved = false;
     for (let i = 0; i < order.length && !improved; i++) {
-      for (let j = i + 1; j < Math.min(order.length, i + 4); j++) {
+      for (let j = i + 1; j < Math.min(order.length, i + 2); j++) {
         if (Math.floor(i / 4) === Math.floor(j / 4)) continue; // same court: splits already cover it
         const candidate = [...order];
         [candidate[i], candidate[j]] = [candidate[j], candidate[i]];
-        const c = totalCost(candidate);
-        if (c < current) { order = candidate; current = c; improved = true; break; }
+        const r = repeatsOnly(candidate);
+        if (r >= curRepeats) continue;
+        const g = gapSum(candidate);
+        if (g > curGap + GAP_TOLERANCE) continue;   // not at the cost of fairness
+        order = candidate; curRepeats = r; curGap = g; improved = true; break;
       }
     }
     if (!improved) break;
@@ -240,14 +318,34 @@ function buildAmericanoRound(activePlayers, history, courts, attempts = 400) {
   return { matches: best || [], sitting: sitters };
 }
 
-export function buildRound(tournament, playersById, standings) {
+// `levels` maps playerId -> rating on the 0-7 scale (PC Rating). It is what
+// the balance term measures against: current tournament points are far too
+// noisy in the opening rounds, when exactly one or two games have been played,
+// whereas PC Rating already reflects everything the player has ever played.
+// Without it the engine falls back to the tournament's own points so it still
+// works standalone.
+export function buildRound(tournament, playersById, standings, levels) {
   const active = activePlayerIds(tournament).map((id) => playersById[id]).filter(Boolean);
   const history = buildHistory(tournament);
   const roundIndex = (tournament.rounds || []).length;
+
+  let strength;
+  if (levels && Object.keys(levels).length) {
+    strength = (id) => (levels[id] != null ? levels[id] : 2.5);
+  } else {
+    // Fallback: points per game played, rescaled so the numbers sit in a
+    // comparable range to the 0-7 rating scale.
+    strength = (id) => {
+      const s = standings[id];
+      if (!s || !s.played) return 2.5;
+      return (s.points / s.played) / 4;
+    };
+  }
+
   if (tournament.format === FORMATS.AMERICANO) {
     return buildAmericanoRound(active, history, tournament.courts);
   }
-  return buildMexicanoRound(active, standings, history, tournament.courts, tournament.seeding, roundIndex);
+  return buildMexicanoRound(active, standings, history, tournament.courts, tournament.seeding, roundIndex, strength);
 }
 
 // ---------------------------------------------------------------------------
